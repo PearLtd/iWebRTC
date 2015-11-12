@@ -23,6 +23,7 @@ limitations under the License.
 <body onload="start()" onunload="stop()">
     <span id="outputtext"></span>
     <hr />
+    <textarea id="inputtext" style="width:100%" onkeypress="onUserKeyPressEvent(event)"></textarea>
     <script type="text/javascript">
         var connection = null;
         var datachannel = null;
@@ -61,11 +62,11 @@ limitations under the License.
             }
         }
 
-        function onNewDataChannel(e) {
-            alert("Channel [" + e.channel.label + "] created!");
-            e.channel.onmessage = onChannelMessage;
-        }        function onChannelMessage(e) {
-            alert("Received message on channel [" + e.target.label + "]: " + e.data);
+        function onNewDataChannel(e)
+        {
+            msg("Channel [" + e.channel.label + "] created");
+            datachannel = e.channel;
+            datachannel.onmessage = function (event) { msg("Remote: " + event.data); }
         }
 
         function onUserKeyPressEvent(event) {
@@ -87,7 +88,7 @@ limitations under the License.
                 }
                 msg('Posting WebRTC offer...');
 
-                wsocket = new WebSocket("ws://{{{WEBSOCKET_URL}}}/websocketInit");
+                wsocket = new WebSocket((window.location.protocol == "http:" ? "ws" : "wss" ) + "://" + window.location.host + "/websocketInit");
                 wsocket.onopen = function (evt) { msg("WebSocket connected"); wsocket.send(sdp);}
                 wsocket.onmessage = function (evt)
                 {

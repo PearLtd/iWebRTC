@@ -19,6 +19,8 @@ limitations under the License.
 
 #include "ILibAsyncSocket.h"
 
+#define ILibTransports_WebRTC_DataChannel 0x51
+
 typedef void* ILibWrapper_WebRTC_ConnectionFactory;
 typedef void* ILibWrapper_WebRTC_Connection;
 
@@ -28,15 +30,25 @@ typedef void(*ILibWrapper_WebRTC_DataChannel_OnData)(struct ILibWrapper_WebRTC_D
 typedef void(*ILibWrapper_WebRTC_DataChannel_OnRawData)(struct ILibWrapper_WebRTC_DataChannel* dataChannel, char* data, int dataLen, int dataType);
 typedef void(*ILibWrapper_WebRTC_DataChannel_OnClosed)(struct ILibWrapper_WebRTC_DataChannel* dataChannel);
 typedef struct ILibWrapper_WebRTC_DataChannel
-{
-	unsigned short streamId;
-	char* channelName;
+{	
 	ILibWrapper_WebRTC_DataChannel_OnData OnBinaryData;
 	ILibWrapper_WebRTC_DataChannel_OnData OnStringData;
 	ILibWrapper_WebRTC_DataChannel_OnRawData OnRawData;
+	void* Chain;
+	ILibTransport_SendPtr SendPtr;
+	ILibTransport_ClosePtr ClosePtr;
+	ILibTransport_PendingBytesToSendPtr PendingBytesPtr;
+	unsigned int IdentifierFlags;
+	/*
+	*
+	* DO NOT MODIFY STRUCT DEFINITION ABOVE THIS COMMENT BLOCK
+	*
+	*/
+	unsigned short streamId;
+	char* channelName;
+
 	ILibWrapper_WebRTC_DataChannel_OnDataChannelAck OnAck;
 	ILibWrapper_WebRTC_DataChannel_OnClosed OnClosed;
-
 	ILibWrapper_WebRTC_Connection parent;
 	void* userData;
 }ILibWrapper_WebRTC_DataChannel;
@@ -80,6 +92,9 @@ void ILibWrapper_WebRTC_Connection_Disconnect(ILibWrapper_WebRTC_Connection conn
 // Destroys a WebRTC Connection
 void ILibWrapper_WebRTC_Connection_DestroyConnection(ILibWrapper_WebRTC_Connection connection);
 
+// Closes the WebRTC Data Channel
+void ILibWrapper_WebRTC_DataChannel_Close(ILibWrapper_WebRTC_DataChannel* dataChannel);
+
 // Creates a WebRTC Data Channel, using the next available Stream ID
 ILibWrapper_WebRTC_DataChannel* ILibWrapper_WebRTC_DataChannel_Create(ILibWrapper_WebRTC_Connection connection, char* channelName, int channelNameLen, ILibWrapper_WebRTC_DataChannel_OnDataChannelAck OnAckHandler);
 
@@ -88,6 +103,8 @@ ILibWrapper_WebRTC_DataChannel* ILibWrapper_WebRTC_DataChannel_CreateEx(ILibWrap
 
 void ILibWrapper_WebRTC_Connection_SetUserData(ILibWrapper_WebRTC_Connection connection, void *user1, void *user2, void *user3);
 void ILibWrapper_WebRTC_Connection_GetUserData(ILibWrapper_WebRTC_Connection connection, void **user1, void **user2, void **user3);
+int ILibWrapper_WebRTC_Connection_DoesPeerSupportUnreliableMode(ILibWrapper_WebRTC_Connection connection);
+int ILibWrapper_WebRTC_Connection_SetReliabilityMode(ILibWrapper_WebRTC_Connection connection, int isOrdered, short maxRetransmits, short maxLifetime);
 
 // WebRTC Connection Management
 
@@ -100,6 +117,11 @@ char* ILibWrapper_WebRTC_Connection_SetOffer(ILibWrapper_WebRTC_Connection conne
 // Generate an udpated SDP offer containing the candidate specified
 char* ILibWrapper_WebRTC_Connection_AddServerReflexiveCandidateToLocalSDP(ILibWrapper_WebRTC_Connection connection, struct sockaddr_in6* candidate);
 
+// Stop reading inbound data
+void ILibWrapper_WebRTC_Connection_Pause(ILibWrapper_WebRTC_Connection connection); 
+
+// Resume reading inbound data
+void ILibWrapper_WebRTC_Connection_Resume(ILibWrapper_WebRTC_Connection connection); 
 
 
 //
@@ -107,13 +129,13 @@ char* ILibWrapper_WebRTC_Connection_AddServerReflexiveCandidateToLocalSDP(ILibWr
 //
 
 // Send Binary Data over the specified Data Channel
-enum ILibAsyncSocket_SendStatus ILibWrapper_WebRTC_DataChannel_Send(ILibWrapper_WebRTC_DataChannel* dataChannel, char* data, int dataLen);
+ILibTransport_DoneState ILibWrapper_WebRTC_DataChannel_Send(ILibWrapper_WebRTC_DataChannel* dataChannel, char* data, int dataLen);
 
 // Send Arbitrary Data over the specified Data Channel. (Must specify the data type)
-enum ILibAsyncSocket_SendStatus ILibWrapper_WebRTC_DataChannel_SendEx(ILibWrapper_WebRTC_DataChannel* dataChannel, char* data, int dataLen, int dataType);
+ILibTransport_DoneState ILibWrapper_WebRTC_DataChannel_SendEx(ILibWrapper_WebRTC_DataChannel* dataChannel, char* data, int dataLen, int dataType);
 
 // Send String Data over the specified Data Channel
-enum ILibAsyncSocket_SendStatus ILibWrapper_WebRTC_DataChannel_SendString(ILibWrapper_WebRTC_DataChannel* dataChannel, char* data, int dataLen);
+ILibTransport_DoneState ILibWrapper_WebRTC_DataChannel_SendString(ILibWrapper_WebRTC_DataChannel* dataChannel, char* data, int dataLen);
 
 #ifdef _WEBRTCDEBUG
 int ILibWrapper_WebRTC_Connection_Debug_Set(ILibWrapper_WebRTC_Connection connection, char* debugFieldName, ILibWrapper_WebRTC_Connection_Debug_OnEvent eventHandler);

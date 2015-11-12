@@ -13,10 +13,16 @@ namespace WebRTC_Sample
         {
             WebRTCCommons.CustomAwaiter<bool> retVal = new WebRTCCommons.CustomAwaiter<bool>();
             retVal.forceWait();
-            f.BeginInvoke((Action<WebRTCCommons.CustomAwaiter<bool>>)((a) =>
+            try
             {
-                a.SetComplete(true);
-            }), retVal);
+                f.BeginInvoke((Action<WebRTCCommons.CustomAwaiter<bool>>)((a) =>
+                {
+                    a.SetComplete(true);
+                }), retVal);
+            }
+            catch
+            {
+            }
             return (retVal);
         }
     }

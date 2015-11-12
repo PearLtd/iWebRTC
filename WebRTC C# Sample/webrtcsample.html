@@ -51,6 +51,7 @@ limitations under the License.
             datachannel = connection.createDataChannel("sampleDataChannel", { reliable: true });
             datachannel.onmessage = function (event) { msg("Remote [" + event.currentTarget.label + "]: " + event.data); }
             datachannel.onopen = function () { msg("Local Data channel creation [sampleDataChannel] was successful"); };
+            datachannel.onclose = function (event) { msg("Channel [" + event.currentTarget.label + "] was closed by remote"); }
 
             connection.ondatachannel = onNewDataChannel;
             connection.onicecandidate = onIceCandidate;
@@ -69,6 +70,7 @@ limitations under the License.
             msg("Channel [" + e.channel.label + "] created by remote peer");
             datachannel = e.channel;
             datachannel.onmessage = onMessage;
+            datachannel.onclose = function (event) { msg("Channel [" + event.currentTarget.label + "] was closed by remote"); }
         }
 
         function onMessage(event)

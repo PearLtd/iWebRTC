@@ -22,6 +22,18 @@
     <ClCompile Include="..\..\..\Bryan%27s Projects\WebRTC\WebRTC C Sample\core\utils.c">
       <Filter>Core</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\..\Bryan%27s Projects\WebRTC\WebRTC C Sample\Microstack\ILibWebServer.c">
+      <Filter>Microstack</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\..\Bryan%27s Projects\WebRTC\WebRTC C Sample\Microstack\ILibAsyncServerSocket.c">
+      <Filter>Microstack</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\..\Bryan%27s Projects\WebRTC\WebRTC C Sample\Microstack\ILibWebClient.c">
+      <Filter>Microstack</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\..\Bryan%27s Projects\WebRTC\WebRTC C Sample\Microstack\ILibRemoteLogging.c">
+      <Filter>Microstack</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="resource.h" />
@@ -46,6 +58,18 @@
     </ClInclude>
     <ClInclude Include="..\..\..\Bryan%27s Projects\WebRTC\WebRTC C Sample\openssl\include\openssl\ssl.h">
       <Filter>OpenSSL</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\..\Bryan%27s Projects\WebRTC\WebRTC C Sample\Microstack\ILibWebServer.h">
+      <Filter>Microstack</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\..\Bryan%27s Projects\WebRTC\WebRTC C Sample\Microstack\ILibAsyncServerSocket.h">
+      <Filter>Microstack</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\..\Bryan%27s Projects\WebRTC\WebRTC C Sample\Microstack\ILibWebClient.h">
+      <Filter>Microstack</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\..\Bryan%27s Projects\WebRTC\WebRTC C Sample\Microstack\ILibRemoteLogging.h">
+      <Filter>Microstack</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>

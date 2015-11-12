@@ -48,6 +48,13 @@ typedef void(*SimpleRendezvousServer_OnPOST)(SimpleRendezvousServer sender, Simp
 typedef void (*SimpleRendezvousServer_OnWebSocket)(SimpleRendezvousServerToken sender, int InterruptFlag, struct packetheader *header, char *bodyBuffer, int bodyBufferLen, SimpleRendezvousServer_WebSocket_DataTypes bodyBufferType, SimpleRendezvousServer_DoneFlag done);
 typedef void (*SimpleRendezvousServer_OnWebSocketClose)(SimpleRendezvousServerToken sender);
 
+#ifndef MICROSTACK_NOTLS
+void SimpleRendezvousServer_SetSSL(SimpleRendezvousServer server, SSL_CTX* ctx);
+#ifdef MICROSTACK_TLS_DETECT
+int SimpleRendezvousServer_IsTLS(SimpleRendezvousServerToken token);
+#endif
+#endif
+
 int SimpleRendezvousServer_IsAuthenticated(SimpleRendezvousServerToken token, char* realm, int realmLen);
 char* SimpleRendezvousServer_GetUsername(SimpleRendezvousServerToken token);
 int SimpleRendezvousServer_ValidatePassword(SimpleRendezvousServerToken token, char* password, int passwordLen);

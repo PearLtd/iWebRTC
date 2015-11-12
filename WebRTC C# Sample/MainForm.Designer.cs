@@ -61,7 +61,7 @@
             this.launchBrowserButton.Name = "launchBrowserButton";
             this.launchBrowserButton.Size = new System.Drawing.Size(131, 41);
             this.launchBrowserButton.TabIndex = 2;
-            this.launchBrowserButton.Text = "Launch Browser";
+            this.launchBrowserButton.Text = "New Instance";
             this.launchBrowserButton.UseVisualStyleBackColor = true;
             this.launchBrowserButton.Click += new System.EventHandler(this.browserButton_Click);
             // 
@@ -234,7 +234,7 @@
             // closeToolStripMenuItem
             // 
             this.closeToolStripMenuItem.Name = "closeToolStripMenuItem";
-            this.closeToolStripMenuItem.Size = new System.Drawing.Size(131, 32);
+            this.closeToolStripMenuItem.Size = new System.Drawing.Size(152, 32);
             this.closeToolStripMenuItem.Text = "&Close";
             // 
             // settingsToolStripMenuItem

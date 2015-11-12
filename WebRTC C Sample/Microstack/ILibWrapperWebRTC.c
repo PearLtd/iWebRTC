@@ -25,21 +25,6 @@ limitations under the License.
 #include "ILibWrapperWebRTC.h"
 #include "../core/utils.h"
 
-#if defined(_ICE_DEBUG_)
-	#define _ILibDebugPrintf
-	#define ILibDebugPrintf_V1(...) printf(__VA_ARGS__)
-	#define ILibDebugPrintf_V2(...) printf(__VA_ARGS__)
-	#define ILibDebugPrintf_V3(...) printf(__VA_ARGS__)
-#elif defined(_ICE_DEBUG_TRANSACTION_)
-	#define _ILibDebugPrintf
-	#define ILibDebugPrintf_V1(...) ;
-	#define ILibDebugPrintf_V2(...) ;
-	#define ILibDebugPrintf_V3(...) printf(__VA_ARGS__)
-#else
-	#define ILibDebugPrintf_V1(...) ;
-	#define ILibDebugPrintf_V2(...) ;
-	#define ILibDebugPrintf_V3(...) ;
-#endif
 
 #if defined(WIN32) && !defined(snprintf) && _MSC_VER < 1900
 #define snprintf(dst, len, frm, ...) _snprintf_s(dst, len, _TRUNCATE, frm, __VA_ARGS__)
@@ -50,7 +35,9 @@ limitations under the License.
 #include <crtdbg.h>
 #endif
 
-#define WEBRTC_CONNECTION_ID_SIZE 8
+#define ILibWrapper_WebRTC_ConnectionFactory_ConnectionBucketSize 16	// *MUST* be a power of 2
+#define ILibWrapper_WebRTC_Connection_DataChannelsBucketSize 16			// *MUST* be a power of 2
+
 #define INET_SOCKADDR_LENGTH(x) ((x==AF_INET6?sizeof(struct sockaddr_in6):sizeof(struct sockaddr_in)))
 #define INET_SOCKADDR_PORT(x) (x->sa_family==AF_INET6?(unsigned short)(((struct sockaddr_in6*)x)->sin6_port):(unsigned short)(((struct sockaddr_in*)x)->sin_port))
 
@@ -64,10 +51,10 @@ typedef struct
 	void (*PostSelect)(void* object,int slct, void *readset, void *writeset, void *errorset);
 	void (*Destroy)(void* object);
 
-	ILibWrapper_WebRTC_ConnectionFactory mFactory;
+	ILibWrapper_WebRTC_ConnectionFactory mStunModule; 
 	void* mChain;
-	void* ConnectionTable;
-
+	ILibSparseArray Connections;
+	int NextConnectionID;
 	struct util_cert selfcert;
 	struct util_cert selftlscert;
 	struct util_cert selftlsclientcert;
@@ -94,7 +81,7 @@ typedef struct
 	int stunIndex;
 	int isConnected;
 
-	char id[WEBRTC_CONNECTION_ID_SIZE];
+	int id;
 	char localUsername[9];
 	char localPassword[33];
 
@@ -108,7 +95,7 @@ typedef struct
 	int isOfferInitiator;
 	int isDtlsClient;
 
-	void *dataChannels;	
+	ILibSparseArray DataChannels;
 
 	ILibWrapper_WebRTC_OnConnectionCandidate OnCandidates;
 	ILibWrapper_WebRTC_Connection_OnConnect OnConnected;
@@ -121,7 +108,24 @@ typedef struct
 // Prototypes:
 int ILibWrapper_WebRTC_PerformStun(ILibWrapper_WebRTC_ConnectionStruct *connection);
 
-
+ILibTransport_DoneState ILibWrapper_ILibTransport_SendSink(void *transport, char* buffer, int bufferLength, ILibTransport_MemoryOwnership ownership, ILibTransport_DoneState done)
+{
+	ILibTransport_DoneState retVal = ILibWrapper_WebRTC_DataChannel_Send((ILibWrapper_WebRTC_DataChannel*)transport, buffer, bufferLength);
+	if (ownership == ILibTransport_MemoryOwnership_CHAIN) free(buffer);
+	return(retVal);
+}
+unsigned int ILibWrapper_ILibTransport_PendingBytesPtr(void *transport)
+{
+	return(ILibSCTP_GetPendingBytesToSend(((ILibWrapper_WebRTC_ConnectionStruct*)((ILibWrapper_WebRTC_DataChannel*)transport)->parent)->dtlsSession));
+}
+void ILibWrapper_InitializeDataChannel_Transport(ILibWrapper_WebRTC_DataChannel *dataChannel)
+{
+	dataChannel->Chain = ((ILibWrapper_WebRTC_ConnectionStruct*)dataChannel->parent)->mFactory->mChain;
+	dataChannel->IdentifierFlags = ILibTransports_WebRTC_DataChannel;
+	dataChannel->ClosePtr = (ILibTransport_ClosePtr)ILibWrapper_WebRTC_DataChannel_Close;
+	dataChannel->SendPtr = (ILibTransport_SendPtr)ILibWrapper_ILibTransport_SendSink;
+	dataChannel->PendingBytesPtr = (ILibTransport_PendingBytesToSendPtr)ILibWrapper_ILibTransport_PendingBytesPtr;
+}
 
 short ILibWrapper_ReadShort(char* buffer, int offset)
 {
@@ -143,28 +147,17 @@ char* ILibWrapper_ReadString(char* buffer, int offset, int length)
 unsigned short ILibWrapper_GetNextStreamId(ILibWrapper_WebRTC_ConnectionStruct *connection)
 {
 	unsigned short id = 0;
-	void *node;
 	int done = 0;
 
-	ILibLinkedList_Lock(connection->dataChannels);
+	ILibSparseArray_Lock(connection->DataChannels);
 
 	while(done==0)
 	{
 		done = 1;
 		while(++id % 2 == (connection->isDtlsClient ? 0 : 1));
-
-		node = ILibLinkedList_GetNode_Head(connection->dataChannels);
-		while(node!=NULL)
-		{
-			if(((ILibWrapper_WebRTC_DataChannel*)ILibLinkedList_GetDataFromNode(node))->streamId == id)
-			{
-				done = 0;
-				break;
-			}
-			node = ILibLinkedList_GetNextNode(node);
-		}
+		if(ILibSparseArray_Get(connection->DataChannels, (int)id)==NULL) {done=0;break;}
 	}
-	ILibLinkedList_UnLock(connection->dataChannels);
+	ILibSparseArray_UnLock(connection->DataChannels);
 
 	return(id);
 }
@@ -200,12 +193,10 @@ int ILibWrapper_SdpToBlock(char* sdp, int sdpLen, int *isActive, char **username
 		if(strcmp(f->data, "a=setup:passive")==0)
         {			
 			BlockFlags |= ILibWebRTC_SDP_Flags_DTLS_SERVER;
-			ILibDebugPrintf_V3("Detected PASSIVE\r\n");
         }
 		else if(strcmp(f->data, "a=setup:active")==0 || strcmp(f->data, "a=setup:actpass")==0)
 		{
 			*isActive = 1;
-			ILibDebugPrintf_V3("Detected ACTIVE\r\n");
 		}
 
 		if(f->datalength > 12 && strncmp(f->data, "a=ice-ufrag:", 12)==0) {*username = f->data + 12;} 
@@ -234,6 +225,7 @@ int ILibWrapper_SdpToBlock(char* sdp, int sdpLen, int *isActive, char **username
 				port = atoi(tmp);
 				
 				pr3 = ILibParseString(pr2->FirstResult->NextResult->NextResult->NextResult->NextResult->data, 0, pr2->FirstResult->NextResult->NextResult->NextResult->NextResult->datalength, ".", 1);					
+				if (pr3->NumResults == 4)
 				{
 					candidateData = pr3->FirstResult->data;
 					pr3->FirstResult->data[pr3->FirstResult->datalength] = 0;
@@ -244,14 +236,14 @@ int ILibWrapper_SdpToBlock(char* sdp, int sdpLen, int *isActive, char **username
 					candidateData[2] = (char)atoi(pr3->FirstResult->NextResult->NextResult->data);
 					pr3->FirstResult->NextResult->NextResult->NextResult->data[pr3->FirstResult->NextResult->NextResult->NextResult->datalength] = 0;
 					candidateData[3] = (char)atoi(pr3->FirstResult->NextResult->NextResult->NextResult->data);
+
+					((unsigned short*)candidateData)[2] = htons(port);
+					candidateData[6] = 0;
+
+					ILibPushStack(&candidates, candidateData);
+					++candidatecount;
 				}
 				ILibDestructParserResults(pr3);
-
-				((unsigned short*)candidateData)[2] = htons(port);
-				candidateData[6] = 0;
-
-				ILibPushStack(&candidates, candidateData);
-				++candidatecount;
 			}
 
 			ILibDestructParserResults(pr2);
@@ -394,6 +386,15 @@ int ILibWrapper_BlockToSDPEx(char* block, int blockLen, char** username, char** 
 	}
 	return(x);
 }
+
+void ILibWrapper_BlockToUserNamePWD(char* block, int blockLen, char **username, int *usernameLen, char** password, int *passwordLen)
+{
+	*usernameLen = (int)block[6];
+	*passwordLen = (int)block[7 + *usernameLen];
+
+    *username = ILibWrapper_ReadString(block, 7, *usernameLen);            
+    *password = ILibWrapper_ReadString(block, 8 + *usernameLen, *passwordLen);
+}
 int ILibWrapper_BlockToSDP(char* block, int blockLen, int isActive, char** username, char** password, char **sdp)
 {
 	return(ILibWrapper_BlockToSDPEx(block, blockLen, username, password, sdp, NULL, 0));
@@ -412,7 +413,9 @@ void ILibWrapper_WebRTC_InitializeCrypto(ILibWrapper_WebRTC_ConnectionFactoryStr
 	util_mkCert(&(factory->selfcert), &(factory->selftlsclientcert), 2048, 10000, "localhost", CERTIFICATE_TLS_CLIENT, NULL);
 
 	// Init DTLS
-	factory->ctx = SSL_CTX_new(DTLSv1_method());
+	factory->ctx = SSL_CTX_new(DTLS_method());
+	SSL_CTX_set_ecdh_auto(factory->ctx, 1);
+
 	SSL_CTX_use_certificate(factory->ctx, factory->selftlscert.x509);
 	SSL_CTX_use_PrivateKey(factory->ctx, factory->selftlscert.pkey);		
 	X509_digest(factory->selftlscert.x509, EVP_get_digestbyname("sha256"), (unsigned char*)factory->tlsServerCertThumbprint, (unsigned int*)&l);
@@ -435,38 +438,36 @@ void ILibWrapper_WebRTC_UnInitializeCrypto(ILibWrapper_WebRTC_ConnectionFactoryS
 	// UnInit SSL
 	util_openssl_uninit();
 }
+
+void ILibWrapper_WebRTC_ConnectionFactory_OnDestroyEx(ILibSparseArray sender, int index, void *value, void *user)
+{
+	ILibWrapper_WebRTC_Connection_DestroyConnection((ILibWrapper_WebRTC_Connection)value);
+}
 void ILibWrapper_WebRTC_ConnectionFactory_OnDestroy(void *obj)
 {
 	ILibWrapper_WebRTC_ConnectionFactoryStruct *cfs = (ILibWrapper_WebRTC_ConnectionFactoryStruct*)obj;
-	void *en = ILibHashTree_GetEnumerator(cfs->ConnectionTable);
-	char *key;
-	int keyLen;
-	void *data;
 
-
-	while(ILibHashTree_MoveNext(en)==0)
-	{
-		ILibHashTree_GetValue(en, &key, &keyLen, &data);
-		ILibWrapper_WebRTC_Connection_DestroyConnection(data);
-	}
-	ILibHashTree_DestroyEnumerator(en);
-
-	ILibDestroyHashTree(cfs->ConnectionTable);
+	ILibSparseArray_DestroyEx(cfs->Connections, ILibWrapper_WebRTC_ConnectionFactory_OnDestroyEx, cfs);
 	ILibWrapper_WebRTC_UnInitializeCrypto((ILibWrapper_WebRTC_ConnectionFactoryStruct*)obj);
 }
 
-
+void ILibWrapper_WebRTC_Connection_DestroyConnectionEx(ILibSparseArray sender, int index, void *value, void *user)
+{
+	ILibWrapper_WebRTC_DataChannel *dc = (ILibWrapper_WebRTC_DataChannel*)value;
+	if(dc->OnClosed!=NULL) {dc->OnClosed(dc);}
+	free(dc->channelName);
+	free(dc);
+}
 void ILibWrapper_WebRTC_Connection_DestroyConnection(ILibWrapper_WebRTC_Connection connection)
 {
 	ILibWrapper_WebRTC_ConnectionStruct *obj = (ILibWrapper_WebRTC_ConnectionStruct*)connection;
-	ILibWrapper_WebRTC_DataChannel *dc;
 
 	if(obj==NULL) {return;}
 
 	
 	if(ILibIsChainBeingDestroyed(obj->mFactory->mChain)==0)
 	{
-		ILibDeleteEntry(obj->mFactory->ConnectionTable, obj->id, WEBRTC_CONNECTION_ID_SIZE);
+		ILibSparseArray_Remove(obj->mFactory->Connections, obj->id);
 
 		// Chain is not being destroyed, so we can disconnect DTLS		
 		if(obj->dtlsSession!=NULL)
@@ -478,17 +479,17 @@ void ILibWrapper_WebRTC_Connection_DestroyConnection(ILibWrapper_WebRTC_Connecti
 			if(obj->offerBlock!=NULL && obj->offerBlockLen>0)
 			{
 				// Clear the ICE State for the local Offer
-				ILibStun_ClearIceState(obj->mFactory->mFactory, ILibStun_CharToSlot(obj->offerBlock[7]));
+				ILibStun_ClearIceState(obj->mFactory->mStunModule, ILibStun_CharToSlot(obj->offerBlock[7]));
 			}
 			if(obj->remoteOfferBlock!=NULL && obj->remoteOfferBlockLen>0)
 			{
 				// Clear the ICE State for the remote Offer
-				ILibStun_ClearIceState(obj->mFactory->mFactory, ILibStun_CharToSlot(obj->remoteOfferBlock[7]));
+				ILibStun_ClearIceState(obj->mFactory->mStunModule, ILibStun_CharToSlot(obj->remoteOfferBlock[7]));
 			}
 		}
 	}
 
-	ILibWebRTC_SetUserObject(obj->mFactory->mFactory, obj->localUsername, NULL);
+	ILibWebRTC_SetUserObject(obj->mFactory->mStunModule, obj->localUsername, NULL);
 
 	if(obj->stunServerList!=NULL && obj->stunServerListLength>0)
 	{
@@ -513,17 +514,7 @@ void ILibWrapper_WebRTC_Connection_DestroyConnection(ILibWrapper_WebRTC_Connecti
 		obj->remoteOfferBlock = NULL;
 	}
 
-	while(ILibLinkedList_GetCount(obj->dataChannels)>0)
-	{
-		dc = (ILibWrapper_WebRTC_DataChannel*)ILibLinkedList_GetDataFromNode(ILibLinkedList_GetNode_Head(obj->dataChannels));
-		if(dc->OnClosed!=NULL) {dc->OnClosed(dc);}
-		free(dc->channelName);
-		free(dc);
-
-		ILibLinkedList_Remove(ILibLinkedList_GetNode_Head(obj->dataChannels));
-	}
-	ILibLinkedList_Destroy(obj->dataChannels);
-
+	ILibSparseArray_DestroyEx(obj->DataChannels, &ILibWrapper_WebRTC_Connection_DestroyConnectionEx, obj);
 	if(obj->stunServerFlags!=NULL)
 	{
 		free(obj->stunServerFlags);
@@ -531,6 +522,7 @@ void ILibWrapper_WebRTC_Connection_DestroyConnection(ILibWrapper_WebRTC_Connecti
 
 	free(obj);
 }
+
 
 void ILibWrapper_WebRTC_Connection_Disconnect(ILibWrapper_WebRTC_Connection connection)
 {
@@ -548,12 +540,12 @@ void ILibWrapper_WebRTC_Connection_Disconnect(ILibWrapper_WebRTC_Connection conn
 		if(obj->offerBlock!=NULL && obj->offerBlockLen>0)
 		{
 			// Clear the ICE State for the local Offer
-			ILibStun_ClearIceState(obj->mFactory->mFactory, ILibStun_CharToSlot(obj->offerBlock[7]));
+			ILibStun_ClearIceState(obj->mFactory->mStunModule, ILibStun_CharToSlot(obj->offerBlock[7]));
 		}
 		if(obj->remoteOfferBlock!=NULL && obj->remoteOfferBlockLen>0)
 		{
 			// Clear the ICE State for the remote Offer
-			ILibStun_ClearIceState(obj->mFactory->mFactory, ILibStun_CharToSlot(obj->remoteOfferBlock[7]));
+			ILibStun_ClearIceState(obj->mFactory->mStunModule, ILibStun_CharToSlot(obj->remoteOfferBlock[7]));
 		}
 
 		if(obj->OnConnected!=NULL) {obj->OnConnected(connection, 0);}
@@ -569,7 +561,6 @@ void ILibWrapper_WebRTC_OnStunResult(void* StunModule, ILibStun_Results Result, 
 	switch(Result)
 	{
 		case ILibStun_Results_Unknown:
-		case ILibStun_Results_ServerError_RFC5780_NOT_IMPLEMENTED:
 			// The STUN Server we used is no good, so try with a different server
 			connection->stunServerFlags[connection->stunIndex] = 2;
 			if(ILibWrapper_WebRTC_PerformStun(connection)!=0 && connection->OnCandidates!=NULL)
@@ -578,9 +569,7 @@ void ILibWrapper_WebRTC_OnStunResult(void* StunModule, ILibStun_Results Result, 
 				connection->OnCandidates(connection, NULL);
 			}
 			break;
-		case ILibStun_Results_Full_Cone_NAT:
-		case ILibStun_Results_Port_Restricted_NAT:
-		case ILibStun_Results_Restricted_NAT:
+		case ILibStun_Results_Public_Interface:
 			if(connection->OnCandidates!=NULL)
 			{
 				connection->OnCandidates(connection, (struct sockaddr_in6*)PublicIP);
@@ -593,13 +582,7 @@ void ILibWrapper_WebRTC_OnStunResult(void* StunModule, ILibStun_Results Result, 
 				connection->OnCandidates(connection, NULL);
 			}
 			break;
-		case ILibStun_Results_Symetric_NAT:
-			// This won't work... 
-			//ToDo: Add support for basic Port Prediction
-			if(connection->OnCandidates!=NULL)
-			{
-				connection->OnCandidates(connection, NULL);
-			}
+		default:
 			break;
 	}
 }
@@ -639,26 +622,9 @@ void ILibWrapper_WebRTC_OnConnectSink(void *StunModule, void* module, int connec
 void ILibWrapper_WebRTC_OnDataSink(void* StunModule, void* module, unsigned short streamId, int pid, char* buffer, int bufferLen, void** user)
 {
 	ILibWrapper_WebRTC_DataChannel *dc = NULL;
-	if(*user==NULL)
-	{		
-		ILibWrapper_WebRTC_ConnectionStruct *connection = (ILibWrapper_WebRTC_ConnectionStruct*)ILibWebRTC_GetUserObjectFromDtlsSession(module);
-		void *node = ILibLinkedList_GetNode_Head(connection->dataChannels);
+	ILibWrapper_WebRTC_ConnectionStruct *connection = (ILibWrapper_WebRTC_ConnectionStruct*)ILibWebRTC_GetUserObjectFromDtlsSession(module);
 
-		while(node!=NULL)
-		{
-			dc = (ILibWrapper_WebRTC_DataChannel*)ILibLinkedList_GetDataFromNode(node);
-			if(dc->streamId == streamId)
-			{
-				*user = dc;
-				break;
-			}
-			node = ILibLinkedList_GetNextNode(node);
-		}		
-	}
-	else
-	{
-		dc = (ILibWrapper_WebRTC_DataChannel*)*user;
-	}
+	dc = (ILibWrapper_WebRTC_DataChannel*)ILibSparseArray_Get(connection->DataChannels, (int)streamId);
 
 	if(dc!=NULL)
 	{
@@ -675,75 +641,68 @@ void ILibWrapper_WebRTC_OnSendOKSink(void* StunModule, void* module, void* user)
 		obj->OnSendOK(obj);
 	}
 }
+void ILibWrapper_WebRTC_OnDataChannelClosed(void *StunModule, void* WebRTCModule, unsigned short StreamId)
+{
+	ILibWrapper_WebRTC_ConnectionStruct *obj = (ILibWrapper_WebRTC_ConnectionStruct*) ILibWebRTC_GetUserObjectFromDtlsSession(WebRTCModule);
+	ILibWrapper_WebRTC_DataChannel* dataChannel = NULL;
+	
+	ILibSparseArray_Lock(obj->DataChannels);
+	dataChannel = (ILibWrapper_WebRTC_DataChannel*)ILibSparseArray_Remove(obj->DataChannels, (int)StreamId);
+	ILibSparseArray_UnLock(obj->DataChannels);
+	ILibRemoteLogging_printf(ILibChainGetLogger(obj->mFactory->mChain), ILibRemoteLogging_Modules_WebRTC_SCTP, ILibRemoteLogging_Flags_VerbosityLevel_1, "[ILibWrapperWebRTC] Data Channel Signaled to Close: [%s]:%u", dataChannel != NULL ? dataChannel->channelName : "UNKNOWN", StreamId);
 
+	if(dataChannel!=NULL) {ILibWrapper_WebRTC_Connection_DestroyConnectionEx(obj->DataChannels, (int)StreamId, dataChannel, obj);}
+}
 int ILibWrapper_WebRTC_OnDataChannel(void *StunModule, void* WebRTCModule, unsigned short StreamId, char* ChannelName, int ChannelNameLength)
 {
 	ILibWrapper_WebRTC_ConnectionStruct *obj = (ILibWrapper_WebRTC_ConnectionStruct*) ILibWebRTC_GetUserObjectFromDtlsSession(WebRTCModule);
 	ILibWrapper_WebRTC_DataChannel* dataChannel = NULL;
-	void *node;
+
+	ILibSparseArray_Lock(obj->DataChannels);
+	if((dataChannel = (ILibWrapper_WebRTC_DataChannel*)ILibSparseArray_Get(obj->DataChannels, (int)StreamId))==NULL)
+	{
+		if((dataChannel = (ILibWrapper_WebRTC_DataChannel*)malloc(sizeof(ILibWrapper_WebRTC_DataChannel)))==NULL){ILIBCRITICALEXIT(254);}
+		memset(dataChannel, 0, sizeof(ILibWrapper_WebRTC_DataChannel));
+
+		dataChannel->parent = obj;
+		dataChannel->streamId = StreamId;
+		if((dataChannel->channelName = (char*)malloc(ChannelNameLength+1))==NULL){ILIBCRITICALEXIT(254);}
+		ChannelName[ChannelNameLength] = 0;
+		dataChannel->channelName[ChannelNameLength] = 0;
+		memcpy(dataChannel->channelName, ChannelName, ChannelNameLength);
+		ILibSparseArray_Add(obj->DataChannels, (int)StreamId, dataChannel);
+		ILibWrapper_InitializeDataChannel_Transport(dataChannel);
+	}
+	ILibSparseArray_UnLock(obj->DataChannels);
 
 	if(obj->OnDataChannel!=NULL)
-	{
-		ILibLinkedList_Lock(obj->dataChannels);		
-		{
-			node = ILibLinkedList_GetNode_Head(obj->dataChannels);
-			while(node!=NULL)
-			{
-				dataChannel = (ILibWrapper_WebRTC_DataChannel*)ILibLinkedList_GetDataFromNode(node);
-				if(dataChannel->streamId == StreamId)
-				{
-					break;
-				}
-				dataChannel = NULL;
-				node = ILibLinkedList_GetNextNode(node);
-			}
-		
-			if(dataChannel == NULL)
-			{
-				if((dataChannel = (ILibWrapper_WebRTC_DataChannel*)malloc(sizeof(ILibWrapper_WebRTC_DataChannel)))==NULL){ILIBCRITICALEXIT(254);}
-				memset(dataChannel, 0, sizeof(ILibWrapper_WebRTC_DataChannel));
-
-				dataChannel->parent = obj;
-				dataChannel->streamId = StreamId;
-				if((dataChannel->channelName = (char*)malloc(ChannelNameLength+1))==NULL){ILIBCRITICALEXIT(254);}
-				ChannelName[ChannelNameLength] = 0;
-				strcpy(dataChannel->channelName, ChannelName);
-				ILibLinkedList_AddTail(obj->dataChannels, dataChannel);
-			}
-		}
-		ILibLinkedList_UnLock(obj->dataChannels);
-			
+	{			
 		obj->OnDataChannel(obj, dataChannel);
 	}
-	//
-	// 0 = ACK DATA CHANNEL
-	// 1 = DO NOT ACK DATA CHANNEL
-	//
-	return(dataChannel==NULL?1:0); 
+
+	return(0); // We always return 0, becuase we want the default ACK behavior that is handled underneath
 }
 void ILibWrapper_WebRTC_OnDataChannelAck(void *StunModule, void* WebRTCModule, unsigned short StreamId)
 {
 	ILibWrapper_WebRTC_ConnectionStruct *connection = (ILibWrapper_WebRTC_ConnectionStruct*)ILibWebRTC_GetUserObjectFromDtlsSession(WebRTCModule);
 	ILibWrapper_WebRTC_DataChannel *dataChannel;
-	void* node;
 
 	if(connection!=NULL)
 	{
-		node = ILibLinkedList_GetNode_Head(connection->dataChannels);
-		while(node!=NULL)
-		{
-			dataChannel = (ILibWrapper_WebRTC_DataChannel*)ILibLinkedList_GetDataFromNode(node);
-			if(dataChannel!=NULL && dataChannel->streamId == StreamId)
-			{
-				if(dataChannel->OnAck != NULL) {dataChannel->OnAck(dataChannel);}
-				break;
-			}
-			node = ILibLinkedList_GetNextNode(node);
-		}
+		ILibSparseArray_Lock(connection->DataChannels);
+		dataChannel = (ILibWrapper_WebRTC_DataChannel*)ILibSparseArray_Get(connection->DataChannels, (int)StreamId);
+		ILibSparseArray_UnLock(connection->DataChannels);
+
+		if(dataChannel!=NULL && dataChannel->OnAck!=NULL)  {dataChannel->OnAck(dataChannel);}
 	}
 }
 void ILibWrapper_WebRTC_OnOfferUpdated(void* stunModule, char* iceOffer, int iceOfferLen)
 {
+}
+
+int ILibWrapper_WebRTC_ConnectionFactory_Bucketizer(int index)
+{
+	return(index & (ILibWrapper_WebRTC_ConnectionFactory_ConnectionBucketSize-1));
 }
 
 ILibWrapper_WebRTC_ConnectionFactory ILibWrapper_WebRTC_ConnectionFactory_CreateConnectionFactory(void* chain, unsigned short localPort)
@@ -757,17 +716,20 @@ ILibWrapper_WebRTC_ConnectionFactory ILibWrapper_WebRTC_ConnectionFactory_Create
 	retVal->Destroy = &ILibWrapper_WebRTC_ConnectionFactory_OnDestroy;
 	ILibWrapper_WebRTC_InitializeCrypto(retVal);
 
-	retVal->mFactory = ILibStunClient_Start(chain, localPort, &ILibWrapper_WebRTC_OnStunResult);
-	ILibStunClient_SetOptions(retVal->mFactory, retVal->ctx, retVal->tlsServerCertThumbprint);
-	ILibSCTP_SetCallbacks(retVal->mFactory, &ILibWrapper_WebRTC_OnConnectSink, &ILibWrapper_WebRTC_OnDataSink, &ILibWrapper_WebRTC_OnSendOKSink);
-	ILibWebRTC_SetCallbacks(retVal->mFactory, &ILibWrapper_WebRTC_OnDataChannel, &ILibWrapper_WebRTC_OnDataChannelAck, &ILibWrapper_WebRTC_OnOfferUpdated);
+	retVal->mStunModule = ILibStunClient_Start(chain, localPort, &ILibWrapper_WebRTC_OnStunResult);
+	ILibStunClient_SetOptions(retVal->mStunModule, retVal->ctx, retVal->tlsServerCertThumbprint);
+	ILibSCTP_SetCallbacks(retVal->mStunModule, &ILibWrapper_WebRTC_OnConnectSink, &ILibWrapper_WebRTC_OnDataSink, &ILibWrapper_WebRTC_OnSendOKSink);
+	ILibWebRTC_SetCallbacks(retVal->mStunModule, &ILibWrapper_WebRTC_OnDataChannel, &ILibWrapper_WebRTC_OnDataChannelClosed, &ILibWrapper_WebRTC_OnDataChannelAck, &ILibWrapper_WebRTC_OnOfferUpdated);
 	
-	retVal->ConnectionTable = ILibInitHashTree();
+	retVal->Connections = ILibSparseArray_Create(ILibWrapper_WebRTC_ConnectionFactory_ConnectionBucketSize, &ILibWrapper_WebRTC_ConnectionFactory_Bucketizer);
 	retVal->mChain = chain;
 
-	
-
 	return(retVal); 
+}
+
+int ILibWrapper_WebRTC_Connection_DataChannelBucketizer(int index)
+{
+	return(index & (ILibWrapper_WebRTC_Connection_DataChannelsBucketSize - 1));
 }
 
 ILibWrapper_WebRTC_Connection ILibWrapper_WebRTC_ConnectionFactory_CreateConnection(ILibWrapper_WebRTC_ConnectionFactory factory, ILibWrapper_WebRTC_Connection_OnConnect OnConnectHandler, ILibWrapper_WebRTC_Connection_OnDataChannel OnDataChannelHandler, ILibWrapper_WebRTC_Connection_OnSendOK OnConnectionSendOK)
@@ -782,13 +744,13 @@ ILibWrapper_WebRTC_Connection ILibWrapper_WebRTC_ConnectionFactory_CreateConnect
 	retVal->OnSendOK = OnConnectionSendOK;
 
 	retVal->mFactory = (ILibWrapper_WebRTC_ConnectionFactoryStruct*)factory;
-	util_random(WEBRTC_CONNECTION_ID_SIZE, retVal->id);
-
-	ILibHashTree_Lock(retVal->mFactory->ConnectionTable);
-	ILibAddEntry(retVal->mFactory->ConnectionTable, retVal->id, WEBRTC_CONNECTION_ID_SIZE, retVal);
-	ILibHashTree_UnLock(retVal->mFactory->ConnectionTable);
 	
-	retVal->dataChannels = ILibLinkedList_Create();
+	ILibSparseArray_Lock(retVal->mFactory->Connections);
+		retVal->id = (retVal->mFactory->NextConnectionID)++;
+		ILibSparseArray_Add(retVal->mFactory->Connections, retVal->id, retVal);
+	ILibSparseArray_UnLock(retVal->mFactory->Connections);
+	
+	retVal->DataChannels = ILibSparseArray_Create(ILibWrapper_WebRTC_Connection_DataChannelsBucketSize, &ILibWrapper_WebRTC_Connection_DataChannelBucketizer);
 
 	return(retVal);
 }
@@ -806,12 +768,14 @@ void ILibWrapper_WebRTC_Connection_SetStunServers(ILibWrapper_WebRTC_Connection 
 	obj->stunServerListLength = serverLength;
 	for(i=0;i<serverLength;++i)
 	{
-		obj->stunServerList[i] = (char*)malloc(strlen(serverList[i])+1);
-		strcpy(obj->stunServerList[i], serverList[i]);
+		int sz = strlen(serverList[i]);
+		obj->stunServerList[i] = (char*)malloc(sz+1);
+		(obj->stunServerList[i])[sz] = 0;
+		memcpy(obj->stunServerList[i], serverList[i], sz);
 	}
 }
 
-int ILibWrapper_WebRTC_PerformStun(ILibWrapper_WebRTC_ConnectionStruct *connection)
+int ILibWrapper_WebRTC_PerformStunEx(ILibWrapper_WebRTC_ConnectionStruct *connection, int MappingDetection)
 {
 	int i,delimiter;
 	struct sockaddr_in6 stunServer;
@@ -850,7 +814,14 @@ int ILibWrapper_WebRTC_PerformStun(ILibWrapper_WebRTC_ConnectionStruct *connecti
 						break;
 				}
 				connection->stunIndex = i;
-				ILibStunClient_PerformStun(connection->mFactory->mFactory, (struct sockaddr_in*)&stunServer, connection);
+				if(MappingDetection == 0)
+				{
+					ILibStunClient_PerformStun(connection->mFactory->mStunModule, (struct sockaddr_in*)&stunServer, connection);
+				}
+				else
+				{
+					ILibStunClient_PerformNATBehaviorDiscovery(connection->mFactory->mStunModule, (struct sockaddr_in*)&stunServer, connection);
+				}
 				break;
 			}
 			else
@@ -864,6 +835,17 @@ int ILibWrapper_WebRTC_PerformStun(ILibWrapper_WebRTC_ConnectionStruct *connecti
 	{
 		return(1);
 	}
+}
+int ILibWrapper_WebRTC_PerformStun(ILibWrapper_WebRTC_ConnectionStruct *connection)
+{
+	return(ILibWrapper_WebRTC_PerformStunEx(connection, 0));
+}
+
+
+int ILibWrapper_WebRTC_Connection_DoesPeerSupportUnreliableMode(ILibWrapper_WebRTC_Connection connection)
+{
+	ILibWrapper_WebRTC_ConnectionStruct *obj = (ILibWrapper_WebRTC_ConnectionStruct*) connection;
+	return(ILibSCTP_DoesPeerSupportFeature(obj->dtlsSession, 0xC000));
 }
 
 char* ILibWrapper_WebRTC_Connection_SetOffer(ILibWrapper_WebRTC_Connection connection, char* offer, int offerLen, ILibWrapper_WebRTC_OnConnectionCandidate onCandidates)
@@ -879,15 +861,14 @@ char* ILibWrapper_WebRTC_Connection_SetOffer(ILibWrapper_WebRTC_Connection conne
 	obj->remoteOfferBlockLen = ILibWrapper_SdpToBlock(offer, offerLen, &isActive, &(obj->remoteUsername), &(obj->remotePassword), &(obj->remoteOfferBlock));
 
 	offer[offerLen] = 0;
-	ILibDebugPrintf_V3("Received offer: \r\n%s\r\n", offer);
+	ILibRemoteLogging_printf(ILibChainGetLogger(obj->mFactory->mChain), ILibRemoteLogging_Modules_WebRTC_STUN_ICE, ILibRemoteLogging_Flags_VerbosityLevel_1, "[ILibWrapperWebRTC] Set ICE/Offer: <br/>%s", offer);
 
-
-	obj->offerBlockLen = ILibStun_SetIceOffer2(obj->mFactory->mFactory, obj->remoteOfferBlock, obj->remoteOfferBlockLen, obj->offerBlock!=NULL?obj->localUsername:NULL, obj->offerBlock!=NULL?8:0, obj->offerBlock!=NULL?obj->localPassword:NULL, obj->offerBlock!=NULL?32:0, &obj->offerBlock);	
+	obj->offerBlockLen = ILibStun_SetIceOffer2(obj->mFactory->mStunModule, obj->remoteOfferBlock, obj->remoteOfferBlockLen, obj->offerBlock != NULL ? obj->localUsername : NULL, obj->offerBlock != NULL ? 8 : 0, obj->offerBlock != NULL ? obj->localPassword : NULL, obj->offerBlock != NULL ? 32 : 0, &obj->offerBlock);
 	ILibWrapper_BlockToSDP(obj->offerBlock, obj->offerBlockLen, obj->isOfferInitiator, &un, &up, &sdp);
 
-	ILibDebugPrintf_V3("Response: \r\n%s\r\n", sdp);
+	ILibRemoteLogging_printf(ILibChainGetLogger(obj->mFactory->mChain), ILibRemoteLogging_Modules_WebRTC_STUN_ICE, ILibRemoteLogging_Flags_VerbosityLevel_1, "[ILibWrapperWebRTC] Return ICE/Response: <br/>%s", sdp);
 
-	ILibWebRTC_SetUserObject(obj->mFactory->mFactory, un, obj);
+	ILibWebRTC_SetUserObject(obj->mFactory->mStunModule, un, obj);
 	memcpy(obj->localUsername, un, strlen(un));
 	memcpy(obj->localPassword, up, strlen(up));
 
@@ -907,12 +888,28 @@ char* ILibWrapper_WebRTC_Connection_SetOffer(ILibWrapper_WebRTC_Connection conne
 	return(sdp);
 }
 
+void ILibWrapper_WebRTC_Connection_SetRemoteParameters(ILibWrapper_WebRTC_Connection connection, char *username, int usernameLen, char *password, int passwordLen, char *certHash, int certHashLen)
+{
+}
+
+void ILibWrapper_WebRTC_Connection_GetLocalParameters_ICE(ILibWrapper_WebRTC_Connection connection, char **username, int *usernameLen, char **password, int *passwordLen)
+{
+	ILibWrapper_WebRTC_ConnectionStruct *obj = (ILibWrapper_WebRTC_ConnectionStruct*) connection;
+	ILibWrapper_BlockToUserNamePWD(obj->offerBlock, obj->offerBlockLen, username, usernameLen, password, passwordLen);
+}
+void ILibWrapper_WebRTC_Connection_GetLocalParameters_DTLS(ILibWrapper_WebRTC_Connection connection, char **hash, int *hashLen)
+{
+	ILibWrapper_WebRTC_ConnectionStruct *obj = (ILibWrapper_WebRTC_ConnectionStruct*) connection;
+	*hash = obj->mFactory->tlsServerCertThumbprint;
+	*hashLen = (int)sizeof(obj->mFactory->tlsServerCertThumbprint);
+}
+
 char* ILibWrapper_WebRTC_Connection_GenerateOffer(ILibWrapper_WebRTC_Connection connection, ILibWrapper_WebRTC_OnConnectionCandidate onCandidates)
 {
 	ILibWrapper_WebRTC_ConnectionStruct *obj = (ILibWrapper_WebRTC_ConnectionStruct*) connection;
 
 	char* offer;
-	int offerLen = ILibStun_GenerateIceOffer(obj->mFactory->mFactory, &offer, obj->localUsername, obj->localPassword);
+	int offerLen = ILibStun_GenerateIceOffer(obj->mFactory->mStunModule, &offer, obj->localUsername, obj->localPassword);
 	char *sdp;
 	char* username,*password;
 
@@ -963,17 +960,28 @@ char* ILibWrapper_WebRTC_Connection_AddServerReflexiveCandidateToLocalSDP(ILibWr
 	return(sdp);
 }
 
-enum ILibAsyncSocket_SendStatus ILibWrapper_WebRTC_DataChannel_SendEx(ILibWrapper_WebRTC_DataChannel* dataChannel, char* data, int dataLen, int dataType)
+void ILibWrapper_WebRTC_Connection_Pause(ILibWrapper_WebRTC_Connection connection)
+{
+	ILibWrapper_WebRTC_ConnectionStruct *cs = (ILibWrapper_WebRTC_ConnectionStruct*)connection;
+	ILibSCTP_Pause(cs->dtlsSession);
+}
+void ILibWrapper_WebRTC_Connection_Resume(ILibWrapper_WebRTC_Connection connection)
+{
+	ILibWrapper_WebRTC_ConnectionStruct *cs = (ILibWrapper_WebRTC_ConnectionStruct*)connection;
+	ILibSCTP_Resume(cs->dtlsSession);
+}
+
+ILibTransport_DoneState ILibWrapper_WebRTC_DataChannel_SendEx(ILibWrapper_WebRTC_DataChannel* dataChannel, char* data, int dataLen, int dataType)
 {
 	ILibWrapper_WebRTC_ConnectionStruct *connection = (ILibWrapper_WebRTC_ConnectionStruct*)dataChannel->parent;
 
-	return((enum ILibAsyncSocket_SendStatus)ILibSCTP_SendEx(connection->dtlsSession, dataChannel->streamId, data, dataLen, dataType));
+	return(ILibSCTP_SendEx(connection->dtlsSession, dataChannel->streamId, data, dataLen, dataType));
 }
-enum ILibAsyncSocket_SendStatus ILibWrapper_WebRTC_DataChannel_Send(ILibWrapper_WebRTC_DataChannel* dataChannel, char* data, int dataLen)
+ILibTransport_DoneState ILibWrapper_WebRTC_DataChannel_Send(ILibWrapper_WebRTC_DataChannel* dataChannel, char* data, int dataLen)
 {
 	return(ILibWrapper_WebRTC_DataChannel_SendEx(dataChannel, data, dataLen, 53));
 }
-enum ILibAsyncSocket_SendStatus ILibWrapper_WebRTC_DataChannel_SendString(ILibWrapper_WebRTC_DataChannel* dataChannel, char* data, int dataLen)
+ILibTransport_DoneState ILibWrapper_WebRTC_DataChannel_SendString(ILibWrapper_WebRTC_DataChannel* dataChannel, char* data, int dataLen)
 {
 	return(ILibWrapper_WebRTC_DataChannel_SendEx(dataChannel, data, dataLen, 51));
 }
@@ -981,6 +989,11 @@ enum ILibAsyncSocket_SendStatus ILibWrapper_WebRTC_DataChannel_SendString(ILibWr
 ILibWrapper_WebRTC_DataChannel* ILibWrapper_WebRTC_DataChannel_Create(ILibWrapper_WebRTC_Connection connection, char* channelName, int channelNameLen, ILibWrapper_WebRTC_DataChannel_OnDataChannelAck OnAckHandler)
 {
 	return(ILibWrapper_WebRTC_DataChannel_CreateEx(connection, channelName, channelNameLen, ILibWrapper_GetNextStreamId((ILibWrapper_WebRTC_ConnectionStruct*)connection), OnAckHandler));
+}
+void ILibWrapper_WebRTC_DataChannel_Close(ILibWrapper_WebRTC_DataChannel* dataChannel)
+{
+	ILibWrapper_WebRTC_ConnectionStruct *connection = (ILibWrapper_WebRTC_ConnectionStruct*)dataChannel->parent;
+	ILibWebRTC_CloseDataChannel(connection->dtlsSession, dataChannel->streamId);
 }
 ILibWrapper_WebRTC_DataChannel* ILibWrapper_WebRTC_DataChannel_CreateEx(ILibWrapper_WebRTC_Connection connection, char* channelName, int channelNameLen, unsigned short streamId, ILibWrapper_WebRTC_DataChannel_OnDataChannelAck OnAckHandler)
 {
@@ -996,11 +1009,13 @@ ILibWrapper_WebRTC_DataChannel* ILibWrapper_WebRTC_DataChannel_CreateEx(ILibWrap
 	retVal->streamId = streamId;
 	retVal->OnAck = OnAckHandler;
 
-	ILibLinkedList_Lock(((ILibWrapper_WebRTC_ConnectionStruct*)connection)->dataChannels);
-	ILibLinkedList_AddTail(((ILibWrapper_WebRTC_ConnectionStruct*)connection)->dataChannels, retVal);
-	ILibLinkedList_UnLock(((ILibWrapper_WebRTC_ConnectionStruct*)connection)->dataChannels);
+	ILibSparseArray_Lock(((ILibWrapper_WebRTC_ConnectionStruct*)connection)->DataChannels);
+	ILibSparseArray_Add(((ILibWrapper_WebRTC_ConnectionStruct*)connection)->DataChannels, retVal->streamId, retVal);
+	ILibSparseArray_UnLock(((ILibWrapper_WebRTC_ConnectionStruct*)connection)->DataChannels);
 
-	ILibStun_WebRTC_OpenChannel(((ILibWrapper_WebRTC_ConnectionStruct*)connection)->dtlsSession, streamId, channelName, channelNameLen);
+	ILibWrapper_InitializeDataChannel_Transport(retVal);
+
+	ILibWebRTC_OpenDataChannel(((ILibWrapper_WebRTC_ConnectionStruct*)connection)->dtlsSession, streamId, channelName, channelNameLen);
 	return(retVal);
 }
 void ILibWrapper_WebRTC_ConnectionFactory_SetTurnServer(ILibWrapper_WebRTC_ConnectionFactory factory, struct sockaddr_in6* turnServer, char* username, int usernameLength, char* password, int passwordLength, ILibWebRTC_TURN_ConnectFlags turnSetting)
@@ -1014,7 +1029,7 @@ void ILibWrapper_WebRTC_ConnectionFactory_SetTurnServer(ILibWrapper_WebRTC_Conne
 
 	if(turnSetting == ILibWebRTC_TURN_DISABLED)
 	{
-		ILibWebRTC_SetTurnServer(cf->mFactory, NULL, NULL, 0, NULL, 0, ILibWebRTC_TURN_DISABLED);
+		ILibWebRTC_SetTurnServer(cf->mStunModule, NULL, NULL, 0, NULL, 0, ILibWebRTC_TURN_DISABLED);
 	}
 	else
 	{
@@ -1027,7 +1042,7 @@ void ILibWrapper_WebRTC_ConnectionFactory_SetTurnServer(ILibWrapper_WebRTC_Conne
 		memcpy(cf->mTurnServerPassword, password, passwordLength);
 	
 
-		ILibWebRTC_SetTurnServer(cf->mFactory, turnServer, username, usernameLength, password, passwordLength, turnSetting);
+		ILibWebRTC_SetTurnServer(cf->mStunModule, turnServer, username, usernameLength, password, passwordLength, turnSetting);
 	}
 }
 void ILibWrapper_WebRTC_Connection_SetUserData(ILibWrapper_WebRTC_Connection connection, void *user1, void *user2, void *user3)

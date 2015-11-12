@@ -32,6 +32,10 @@ namespace WebRTC_Sample
 {
     public partial class MainForm : Form
     {
+        private System.IO.Pipes.PipeStream mPipe;
+        private byte[] pipeBuffer = null;
+
+
         private SimpleRendezvousServer mServer;
         private Dictionary<string, RendezvousData> eventTable = new Dictionary<string, RendezvousData>();
         private string htmlpage = null, passiveHtmlpage = null;
@@ -39,7 +43,7 @@ namespace WebRTC_Sample
         private bool StunServersInUse = false;
         private string[] StunServers = { "stun.ekiga.net", "stun.ideasip.com", "stun.schlund.de", "stunserver.org", "stun.softjoys.com", "stun.voiparound.com", "stun.voipbuster.com", "stun.voipstunt.com", "stun.voxgratia.org" };
 
-        public MainForm()
+        public MainForm(string[] args)
         {
             InitializeComponent();
             try
@@ -54,9 +58,30 @@ namespace WebRTC_Sample
                 serverLinkLabel_passive.Text = "http://127.0.0.1:" + mServer.Port.ToString() + "/passive";
             }
             catch (Exception) { serverStatusLabel.Text = "Error"; }
-
+            
+            //WebRTCConnection.ChainAlwaysRunning = true;
+            //this.Text += " [dPort: " + WebRTCConnection.StartDefaultLogger(0).ToString() + "]";
+            
+            if(args.Length == 1)
+            {
+                mPipe = new System.IO.Pipes.NamedPipeClientStream(".", args[0], System.IO.Pipes.PipeDirection.InOut);
+                ((System.IO.Pipes.NamedPipeClientStream)mPipe).Connect();
+                pipeBuffer = new byte[4096];
+                StartClient();
+            }
         }
 
+        private async void StartClient()
+        {
+            SessionForm ss = new SessionForm();
+            userForms.Add("/" + ss.Value.ToString(), ss);
+            ss.Show(this);
+
+            string offer = await ss.Connection.GenerateOffer();
+            byte[] b = UTF8Encoding.UTF8.GetBytes(offer);
+            mPipe.Write(b, 0, b.Length);
+            StartRead(ss);
+        }
         private void GetNewPassivePOC(WebRTCCommons.CustomAwaiter<byte[]> awaiter)
         {
             BeginInvoke((Action<WebRTCCommons.CustomAwaiter<byte[]>>)(async (a) =>
@@ -135,9 +160,33 @@ namespace WebRTC_Sample
 
         private void browserButton_Click(object sender, EventArgs e)
         {
-            System.Diagnostics.Process.Start(serverLinkLabel.Text);
+            mPipe = new System.IO.Pipes.NamedPipeServerStream("bbtest", System.IO.Pipes.PipeDirection.InOut, 1, System.IO.Pipes.PipeTransmissionMode.Message, System.IO.Pipes.PipeOptions.Asynchronous);
+            System.Diagnostics.Process.Start(Application.ExecutablePath, "bbtest");
+            pipeBuffer = new byte[4096];
+            SessionForm ss = new SessionForm();
+            userForms.Add("/" + ss.Value.ToString(), ss);
+            ss.Show(this);
+            ((System.IO.Pipes.NamedPipeServerStream)mPipe).BeginWaitForConnection(WaitForConnectionSink, ss);
         }
 
+        private void WaitForConnectionSink(IAsyncResult result)
+        {
+            SessionForm ss = (SessionForm)result.AsyncState;
+            ((System.IO.Pipes.NamedPipeServerStream)mPipe).EndWaitForConnection(result);
+            StartRead(ss);
+        }
+        private async void StartRead(SessionForm ss)
+        {
+            int bytesRead = await mPipe.ReadAsync(pipeBuffer, 0, pipeBuffer.Length);
+            string offer = UTF8Encoding.UTF8.GetString(pipeBuffer, 0, bytesRead);
+            string resp = await ss.Connection.SetOffer(offer);
+            byte[] respB = UTF8Encoding.UTF8.GetBytes(resp);
+            if (mPipe as System.IO.Pipes.NamedPipeClientStream == null)
+            {
+                await mPipe.WriteAsync(respB, 0, respB.Length);
+            }
+
+        }
         private void serverLinkLabel_LinkClicked(object sender, LinkLabelLinkClickedEventArgs e)
         {
             System.Diagnostics.Process.Start(serverLinkLabel.Text);

@@ -41,20 +41,6 @@ limitations under the License.
 #include <crtdbg.h>
 #endif
 
-#if defined(__SYMBIAN32__)
-#include <libc\stddef.h>
-#include <libc\sys\types.h>
-#include <libc\sys\socket.h>
-#include <libc\sys\errno.h>
-#include <libc\sys\time.h>
-#include <libc\netinet\in.h>
-#include <libc\arpa\inet.h>
-
-#include "ILibSymbianSemaphore.h"
-#include "ILibSocketWrapper.h"
-#include "ILibChainAdaptor.h"
-#endif
-
 #if defined(WINSOCK2)
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -77,15 +63,29 @@ limitations under the License.
 #include <sys/sysctl.h>
 #endif
 
-#if defined(WIN32) && !defined(snprintf) && _MSC_VER < 1900
+#if defined(WIN32) && !defined(snprintf) && (_MSC_PLATFORM_TOOLSET <= 120)
 #define snprintf(dst, len, frm, ...) _snprintf_s(dst, len, _TRUNCATE, frm, __VA_ARGS__)
 #endif
 
 #include "ILibParsers.h"
-#define DEBUGSTATEMENT(x)
 #define MINPORTNUMBER 50000
 #define PORTNUMBERRANGE 15000
 #define UPNP_MAX_WAIT 86400	// 24 Hours
+
+#ifdef _REMOTELOGGINGSERVER
+#include "ILibWebServer.h"
+#endif
+
+#ifndef MICROSTACK_NOTLS
+#include "../core/utils.h"
+#else
+#include "md5.h"
+#endif
+
+#if defined(MICROSTACK_NOTLS)
+char utils_HexTable[16] = { '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F' };
+char utils_HexTable2[16] = { '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f' };
+#endif
 
 // This is to compile on Windows XP, not needed at runtime
 #if !defined(IPV6_V6ONLY)
@@ -114,6 +114,7 @@ CONST IN6_ADDR in6addr_loopback = { { { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 
 char ILibScratchPad[4096];   // General buffer
 char ILibScratchPad2[65536]; // Often used for UDP packet processing
+void* gILibChain = NULL;	 // Global Chain Instance used for Remote Logging when a chain instance isn't otherwise exposed
 
 #define INET_SOCKADDR_LENGTH(x) ((x==AF_INET6?sizeof(struct sockaddr_in6):sizeof(struct sockaddr_in)))
 
@@ -145,9 +146,55 @@ unsigned long long ILibNTOHLL(unsigned long long v)
 	{ union { unsigned long lv[2]; unsigned long long llv; } u; u.llv = v; return ((unsigned long long)ntohl(u.lv[0]) << 32) | (unsigned long long)ntohl(u.lv[1]); }
 }
 
+int ILibWhichPowerOfTwo(int number)
+{
+	int retVal = 0;
+	if(number < 1) {return(-1);}
+	while((number = number >> 1) != 0) {++retVal;}
+	return(retVal);
+}
+
+
 //
 // All of the following structures are meant to be private internal structures
 //
+typedef struct ILibSparseArray_Node
+{
+	int index;
+	void* ptr;
+}ILibSparseArray_Node;
+typedef struct ILibSparseArray_Root
+{
+	ILibSparseArray_Node* bucket;
+	int bucketSize;
+	ILibSparseArray_Bucketizer bucketizer;
+	sem_t LOCK;
+}ILibSparseArray_Root;
+
+typedef enum ILibHashtable_Flags
+{
+	ILibHashtable_Flags_NONE = 0x00,
+	ILibHashtable_Flags_ADD = 0x01,
+	ILibHashtable_Flags_REMOVE = 0x02
+}ILibHashtable_Flags;
+typedef struct ILibHashtable_Node
+{
+	struct ILibHashtable_Node* next;
+	struct ILibHashtable_Node* prev;
+	void* Key1;
+	char* Key2;
+	int Key2Len;
+	void *Data;
+}ILibHashtable_Node;
+typedef struct ILibHashtable_Root
+{
+	ILibSparseArray table;
+	ILibHashtable_Hash_Func hashFunc;
+	ILibSparseArray_Bucketizer bucketizer;
+}ILibHashtable_Root;
+
+
+
 struct ILibStackNode
 {
 	void *Data;
@@ -190,6 +237,7 @@ struct ILibLinkedListNode_Root
 {
 	sem_t LOCK;
 	long count;
+	void* Tag;
 	struct ILibLinkedListNode *Head;
 	struct ILibLinkedListNode *Tail;
 };
@@ -209,6 +257,90 @@ struct ILibReaderWriterLock_Data
 	int PendingWriters;
 	int Exit;
 };
+
+unsigned int ILibTransport_PendingBytesToSend(void *transport)
+{
+	return(((ILibTransport*)transport)->PendingBytes(transport));
+}
+ILibTransport_DoneState ILibTransport_Send(void *transport, char* buffer, int bufferLength, ILibTransport_MemoryOwnership ownership, ILibTransport_DoneState done)
+{
+	return(((ILibTransport*)transport)->Send(transport, buffer, bufferLength, ownership, done));
+}
+void ILibTransport_Close(void *transport)
+{
+	((ILibTransport*)transport)->Close(transport);
+}
+
+
+#if defined(MICROSTACK_NOTLS)
+char* __fastcall util_tohex(char* data, int len, char* out)
+{
+	int i;
+	char *p = out;
+	if (data == NULL || len == 0) { *p = 0; return NULL; }
+	for (i = 0; i < len; i++)
+	{
+		*(p++) = utils_HexTable[((unsigned char)data[i]) >> 4];
+		*(p++) = utils_HexTable[((unsigned char)data[i]) & 0x0F];
+	}
+	*p = 0;
+	return out;
+}
+int __fastcall util_hexToint(char *hexString, int hexStringLength)
+{
+	int i, res = 0;
+
+	// Ignore the leading zeroes
+	while (*hexString == '0' && hexStringLength > 0) { hexString++; hexStringLength--; }
+
+	// Process the rest of the string
+	for (i = 0; i < hexStringLength; i++)
+	{
+		if (hexString[i] >= '0' && hexString[i] <= '9') { res = (res << 4) + (hexString[i] - '0'); }
+		else if (hexString[i] >= 'a' && hexString[i] <= 'f') { res = (res << 4) + (hexString[i] - 'a' + 10); }
+		else if (hexString[i] >= 'A' && hexString[i] <= 'F') { res = (res << 4) + (hexString[i] - 'A' + 10); }
+	}
+	return res;
+}
+
+// Convert hex string to int 
+int __fastcall util_hexToBuf(char *hexString, int hexStringLength, char* output)
+{
+	int i, x = hexStringLength / 2;
+	for (i = 0; i < x; i++) { output[i] = (char)util_hexToint(hexString + (i * 2), 2); }
+	return i;
+}
+// Perform a MD5 hash on the data
+void __fastcall util_md5(char* data, int datalen, char* result)
+{
+	MD5_CTX c;
+	MD5_Init(&c);
+	MD5_Update(&c, data, datalen);
+	MD5_Final((unsigned char*)result, &c);
+}
+
+// Perform a MD5 hash on the data and convert result to HEX and store in output
+// This is useful for HTTP Digest
+void __fastcall util_md5hex(char* data, int datalen, char *out)
+{
+	int i = 0;
+	unsigned char *temp = (unsigned char*)out;
+	MD5_CTX mdContext;
+	unsigned char digest[16];
+
+	MD5_Init(&mdContext);
+	MD5_Update(&mdContext, (unsigned char *)data, datalen);
+	MD5_Final(digest, &mdContext);
+
+	for (i = 0; i < HALF_NONCE_SIZE; i++)
+	{
+		*(temp++) = utils_HexTable2[(unsigned char)digest[i] >> 4];
+		*(temp++) = utils_HexTable2[(unsigned char)digest[i] & 0x0F];
+	}
+
+	*temp = '\0';
+}
+#endif
 
 
 #ifdef WINSOCK2
@@ -387,7 +519,6 @@ int ILibGetLocalIPv4AddressList(struct sockaddr_in** addresslist, int includeloo
 			}
 		}
 	}
-
 	closesocket(sock);
 	return j;
 #elif __APPLE__
@@ -472,7 +603,7 @@ int ILibGetLocalIPv4AddressList(struct sockaddr_in** addresslist, int includeloo
 	// Create an unbound datagram socket to do the SIOCGIFADDR ioctl on.
 	if ((LocalSock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) < 0)
 	{
-		DEBUGSTATEMENT(printf("Can't do that\r\n"));
+		ILibRemoteLogging_printf(ILibChainGetLogger(gILibChain), ILibRemoteLogging_Modules_Microstack_Generic, ILibRemoteLogging_Flags_VerbosityLevel_1, "socket(..) error in ILibGetLocalIPv4AddressList()");
 		ILIBCRITICALERREXIT(253);
 	}
 	// Get the interface configuration information...
@@ -482,7 +613,7 @@ int ILibGetLocalIPv4AddressList(struct sockaddr_in** addresslist, int includeloo
 	
 	if (nResult < 0)
 	{
-		DEBUGSTATEMENT(printf("ioctl error\r\n"));
+		ILibRemoteLogging_printf(ILibChainGetLogger(gILibChain), ILibRemoteLogging_Modules_Microstack_Generic, ILibRemoteLogging_Flags_VerbosityLevel_1, "ioctl(SIOCGIFCONF) error in ILibGetLocalIPv4AddressList()");
 		ILIBCRITICALERREXIT(253);
 	}
 	// Cycle through the list of interfaces looking for IP addresses.
@@ -494,7 +625,7 @@ int ILibGetLocalIPv4AddressList(struct sockaddr_in** addresslist, int includeloo
 		strcpy (ifReq.ifr_name, pifReq -> ifr_name);
 		if (ioctl(LocalSock, SIOCGIFFLAGS, &ifReq) < 0)
 		{
-			DEBUGSTATEMENT(printf("Can't get flags\r\n"));
+			ILibRemoteLogging_printf(ILibChainGetLogger(gILibChain), ILibRemoteLogging_Modules_Microstack_Generic, ILibRemoteLogging_Flags_VerbosityLevel_1, "ioctl(SIOCGIFFLAGS) error in ILibGetLocalIPv4AddressList()");
 			ILIBCRITICALERREXIT(253);
 		}
 		// Skip loopback, point-to-point and down interfaces, except don't skip down interfaces
@@ -841,7 +972,7 @@ int ILibGetLocalIPAddressList(int** pp_int)
 	/* Create an unbound datagram socket to do the SIOCGIFADDR ioctl on. */
 	if ((LocalSock = socket (AF_INET, SOCK_DGRAM, IPPROTO_UDP)) < 0)
 	{
-		DEBUGSTATEMENT(printf("Can't do that\r\n"));
+		ILibRemoteLogging_printf(ILibChainGetLogger(gILibChain), ILibRemoteLogging_Modules_Microstack_Generic, ILibRemoteLogging_Flags_VerbosityLevel_1, "socket(...) error in ILibGetLocalIPAddressList()");
 		ILIBCRITICALERREXIT(253);
 	}
 	/* Get the interface configuration information... */
@@ -850,7 +981,7 @@ int ILibGetLocalIPAddressList(int** pp_int)
 	nResult = ioctl(LocalSock, SIOCGIFCONF, &ifConf);
 	if (nResult < 0)
 	{
-		DEBUGSTATEMENT(printf("ioctl error\r\n"));
+		ILibRemoteLogging_printf(ILibChainGetLogger(gILibChain), ILibRemoteLogging_Modules_Microstack_Generic, ILibRemoteLogging_Flags_VerbosityLevel_1, "ioctl(SIOCGIFCONF) error in ILibGetLocalIPAddressList()");
 		ILIBCRITICALERREXIT(253);
 	}
 	/* Cycle through the list of interfaces looking for IP addresses. */
@@ -862,7 +993,7 @@ int ILibGetLocalIPAddressList(int** pp_int)
 		strcpy (ifReq.ifr_name, pifReq -> ifr_name);
 		if (ioctl (LocalSock, SIOCGIFFLAGS, &ifReq) < 0)
 		{
-			DEBUGSTATEMENT(printf("Can't get flags\r\n"));
+			ILibRemoteLogging_printf(ILibChainGetLogger(gILibChain), ILibRemoteLogging_Modules_Microstack_Generic, ILibRemoteLogging_Flags_VerbosityLevel_1, "ioctl(SIOCGIFFLAGS) error in ILibGetLocalIPAddressList()");
 			ILIBCRITICALERREXIT(253);
 		}
 		/* Skip loopback, point-to-point and down interfaces, */
@@ -887,26 +1018,16 @@ int ILibGetLocalIPAddressList(int** pp_int)
 	if ((*pp_int = (int*)malloc(sizeof(int)*(ctr))) == NULL) ILIBCRITICALEXIT(254);
 	memcpy(*pp_int,tempresults,sizeof(int)*ctr);
 	return(ctr);
-#elif defined(__SYMBIAN32__)
-	//
-	// The Symbian Way :)
-	//
-	int iplist[16];
-	int ctr;
-	ctr = ILibSocketWrapper_GetLocalIPAddressList(iplist);
-	if ((*pp_int = (int*)malloc(sizeof(int)*(ctr))) == NULL) ILIBCRITICALEXIT(254);
-	memcpy(*pp_int,iplist,sizeof(int)*ctr);
-	return(ctr);
 #endif
 }
 
 
-struct ILibChain
+typedef struct ILibChain
 {
 	void (*PreSelect)(void* object,void* readset, void *writeset, void *errorset, int* blocktime);
 	void (*PostSelect)(void* object,int slct, void *readset, void *writeset, void *errorset);
 	void (*Destroy)(void* object);
-};
+}ILibChain;
 
 struct ILibChain_SubChain
 {
@@ -945,10 +1066,23 @@ struct ILibBaseChain_SafeData
 	void *Object;
 };
 
-struct ILibBaseChain
+typedef struct ILibBaseChain
 {
 	int TerminateFlag;
 	int RunningFlag;
+#ifdef _REMOTELOGGING
+	ILibRemoteLogging ChainLogger;
+#ifdef _REMOTELOGGINGSERVER
+	void* LoggingWebServer;
+#endif
+#endif
+	/*
+	*
+	* DO NOT MODIFY STRUCT DEFINITION ABOVE THIS COMMENT BLOCK
+	*
+	*/
+
+
 #if defined(WIN32)
 	DWORD ChainThreadID;
 #else
@@ -960,16 +1094,285 @@ struct ILibBaseChain
 	FILE *TerminateReadPipe;
 	FILE *TerminateWritePipe;
 #endif
-#if defined(__SYMBIAN32__)
-	void *SymbianAdaptor;
-	ILibOnChainStopped OnChainStoppedHandler;
-	void *OnChainStoppedUserObj;
-#endif
+
 	void *Timer;
-	void *Object;
-	struct ILibBaseChain *Next;
 	void *Reserved;
+	ILibLinkedList Links;
+	ILibLinkedList LinksPendingDelete;
+	ILibHashtable ChainStash;
+}ILibBaseChain;
+
+ILibHashtable ILibChain_GetBaseHashtable(void* chain)
+{
+	struct ILibBaseChain *b = (struct ILibBaseChain*)chain;
+	if(b->ChainStash == NULL) {b->ChainStash = ILibHashtable_Create();}
+	return(b->ChainStash);
+}
+
+void ILibChain_OnDestroyEvent_Sink(void *object)
+{
+	void **ptr = (void**)object;
+	if (ptr[4] != NULL)
+	{
+		((ILibChain_DestroyEvent)ptr[4])(ptr[3], ptr[5]);
+	}
+}
+void ILibChain_OnDestroyEvent_AddHandler(void *chain, ILibChain_DestroyEvent sink, void *user)
+{
+	void **ptr = (void**)malloc(6 * sizeof(void*));
+	memset(ptr, 0, 6 * sizeof(void*));
+
+	ptr[2] = (ILibChain_Destroy)&ILibChain_OnDestroyEvent_Sink;
+	ptr[3] = chain;
+	ptr[4] = sink;
+	ptr[5] = user;
+	ILibAddToChain(chain, ptr);
+}
+void ILibChain_OnStartEvent_Sink(void *object)
+{
+	void **ptr = (void**)object;
+	void *chain = ptr[3];
+
+	if (ptr[4] != NULL)
+	{
+		((ILibChain_StartEvent)ptr[4])(ptr[3], ptr[5]);
+	}
+
+	// Adding ourselves to be deleted, since we don't need to be called again.
+	// Don't need to lock anything, because we're on the Microstack Thread
+	ILibLinkedList_AddTail(((ILibBaseChain*)chain)->LinksPendingDelete, object); 
+}
+void ILibChain_OnStartEvent_AddHandler(void *chain, ILibChain_StartEvent sink, void *user)
+{
+	void **ptr = (void**)malloc(6 * sizeof(void*));
+	memset(ptr, 0, 6 * sizeof(void*));
+
+	ptr[0] = (ILibChain_Destroy)&ILibChain_OnStartEvent_Sink;
+	ptr[3] = chain;
+	ptr[4] = sink;
+	ptr[5] = user;
+	ILibAddToChain(chain, ptr);
+}
+
+#if defined(_REMOTELOGGING) && defined(_REMOTELOGGINGSERVER)
+unsigned char ILibDefaultLogger_HTML[3902] =
+{
+	0x1F, 0x8B, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0xC5, 0x5A, 0x7B, 0x93, 0xDA, 0x38, 0x12, 0xFF, 0x2A, 0x8E, 0x52, 0xD9, 0xB1, 0x17, 0x63, 0x30, 0xAF, 0x01, 0x83, 0x27, 0x35, 0x03,
+	0x6C, 0x32, 0xB5, 0x93, 0xC9, 0x64, 0x20, 0x8F, 0xAD, 0xAD, 0x5C, 0x4A, 0xB6, 0x05, 0xF8, 0x62, 0x6C, 0xCE, 0x36, 0xC3, 0xCC, 0x52, 0x7C, 0xB2, 0xFB, 0xE3, 0x3E, 0xD2, 0x7D, 0x85, 0x6B, 0x49,
+	0x7E, 0xC8, 0xE6, 0x91, 0x4D, 0x65, 0xEF, 0x2E, 0xA4, 0x06, 0x5B, 0x6A, 0xB5, 0xBA, 0x5B, 0xDD, 0xAD, 0x5F, 0x4B, 0xFC, 0xFB, 0x9F, 0xFF, 0x1A, 0x3C, 0x1B, 0xBD, 0x1D, 0x4E, 0x7F, 0xBB, 0x1B,
+	0x4B, 0x8B, 0x78, 0xE9, 0x49, 0x77, 0xEF, 0xAF, 0x6E, 0xAE, 0x87, 0x12, 0xAA, 0xD6, 0x6A, 0x1F, 0x9B, 0xC3, 0x5A, 0x6D, 0x34, 0x1D, 0x49, 0x9F, 0x5E, 0x4F, 0xDF, 0xDC, 0x48, 0xBA, 0x56, 0x97,
+	0xA6, 0x21, 0xF6, 0x23, 0x37, 0x76, 0x03, 0x1F, 0x7B, 0xB5, 0xDA, 0xF8, 0x16, 0x49, 0x68, 0x11, 0xC7, 0x2B, 0xA3, 0x56, 0xDB, 0x6C, 0x36, 0xDA, 0xA6, 0xA9, 0x05, 0xE1, 0xBC, 0x36, 0xBD, 0xAF,
+	0x3D, 0x52, 0x5E, 0x3A, 0x1D, 0x9C, 0x3C, 0x56, 0x63, 0x61, 0xA4, 0xE6, 0xC4, 0x0E, 0xBA, 0x90, 0x06, 0xB4, 0x87, 0x7E, 0x11, 0xEC, 0xC0, 0xD7, 0x92, 0xC4, 0x58, 0xB2, 0x03, 0x3F, 0x26, 0x7E,
+	0x6C, 0xA2, 0x98, 0x3C, 0xC6, 0x35, 0x4A, 0xD0, 0x97, 0xEC, 0x05, 0x0E, 0x23, 0x12, 0x9B, 0xEB, 0x78, 0x56, 0xED, 0x22, 0x89, 0x4E, 0x58, 0x25, 0xFF, 0x58, 0xBB, 0x0F, 0x26, 0x1A, 0x72, 0xF2,
+	0xEA, 0xF4, 0x69, 0x45, 0x50, 0xCA, 0x43, 0x24, 0xF8, 0x54, 0x7D, 0x7F, 0x59, 0x1D, 0x06, 0xCB, 0x15, 0x8E, 0x5D, 0xCB, 0x23, 0x28, 0x9F, 0xE0, 0x7A, 0x6C, 0x8E, 0x47, 0xAF, 0xC6, 0xD9, 0x28,
+	0x1F, 0x2F, 0x89, 0x89, 0x66, 0x41, 0xB8, 0xC4, 0x71, 0xD5, 0x21, 0x31, 0xB1, 0xA9, 0xB0, 0x48, 0x94, 0xC8, 0x23, 0xAB, 0x45, 0xE0, 0x13, 0xD3, 0x0F, 0xE8, 0xA8, 0xD8, 0x8D, 0x3D, 0x72, 0xF1,
+	0x91, 0x58, 0xF7, 0xD3, 0xA1, 0x34, 0x22, 0xD6, 0x7A, 0x3E, 0xA8, 0xF1, 0x36, 0x69, 0x10, 0xC5, 0x4F, 0xF4, 0xDB, 0x0A, 0x9C, 0xA7, 0xED, 0x12, 0x87, 0x73, 0xD7, 0x37, 0xEA, 0xFD, 0x15, 0x76,
+	0x1C, 0xD7, 0x9F, 0xC3, 0x93, 0x15, 0x84, 0x0E, 0x09, 0xE1, 0xC1, 0x0E, 0xBC, 0x20, 0x34, 0x2C, 0x0F, 0xDB, 0x5F, 0xFB, 0x33, 0x98, 0xA8, 0x1A, 0xB9, 0x7F, 0x10, 0x43, 0x6F, 0xAE, 0x1E, 0xF9,
+	0xEB, 0x0C, 0x2F, 0x5D, 0xEF, 0xC9, 0x40, 0xD3, 0x10, 0xF8, 0xDB, 0x0B, 0x12, 0x4B, 0x6F, 0x26, 0x48, 0x95, 0x2E, 0x43, 0x17, 0x7B, 0xAA, 0xF4, 0x9A, 0x78, 0x0F, 0x24, 0x76, 0x6D, 0xAC, 0x4A,
+	0x11, 0x58, 0xB7, 0x1A, 0x91, 0xD0, 0x9D, 0xF5, 0x2D, 0x60, 0x36, 0x0F, 0x83, 0xB5, 0xEF, 0x54, 0x39, 0xFB, 0xE7, 0x4E, 0xD3, 0xE9, 0x39, 0x9D, 0xFE, 0xEE, 0x39, 0xD5, 0x05, 0xBB, 0x3E, 0x09,
+	0xB7, 0xFB, 0x44, 0xB3, 0xD9, 0xAC, 0xBF, 0x71, 0x9D, 0x78, 0x61, 0xE8, 0xF5, 0x7A, 0x1D, 0x04, 0x48, 0xE5, 0x96, 0xF0, 0x3A, 0x0E, 0x12, 0x91, 0xAB, 0x71, 0xB0, 0xCA, 0xE4, 0xAF, 0x86, 0xEE,
+	0x7C, 0x11, 0x1B, 0xFA, 0xEA, 0x51, 0x8A, 0x02, 0xCF, 0x75, 0xA4, 0xE7, 0xD6, 0x39, 0xFD, 0xA4, 0xDD, 0x56, 0x10, 0xC7, 0xC1, 0x32, 0x27, 0xF7, 0xC8, 0xEC, 0x10, 0x75, 0x6E, 0x96, 0xDD, 0xF3,
+	0x25, 0x8E, 0x62, 0xEA, 0x0E, 0x5B, 0x2E, 0x09, 0x9B, 0xF9, 0x80, 0xFD, 0x82, 0x07, 0x12, 0xCE, 0xBC, 0x60, 0xC3, 0x09, 0xA8, 0xAB, 0x54, 0xB1, 0xE7, 0xCE, 0x7D, 0x83, 0x49, 0x74, 0xC0, 0x02,
+	0xF5, 0x66, 0x27, 0x51, 0xAE, 0xD7, 0xA1, 0xBA, 0xE5, 0x14, 0x46, 0x38, 0xB7, 0xE4, 0x56, 0x5B, 0xED, 0x76, 0x54, 0xBD, 0x79, 0xAE, 0xF4, 0x25, 0xA1, 0xAB, 0xBA, 0x0C, 0xFE, 0xA8, 0x7A, 0x60,
+	0x2F, 0x1C, 0x56, 0xE7, 0x21, 0x76, 0x5C, 0xF0, 0x03, 0x99, 0x6A, 0xA1, 0x4A, 0x30, 0x0A, 0xE7, 0xC3, 0x54, 0x5D, 0x91, 0xEA, 0x2F, 0x92, 0xD6, 0xBA, 0xDA, 0xD6, 0x55, 0xBD, 0xDE, 0xA0, 0x8D,
+	0x8D, 0xDE, 0x8B, 0x12, 0xCB, 0x0D, 0xB1, 0xBE, 0xBA, 0xB1, 0xC0, 0x8E, 0xB1, 0x57, 0x25, 0xCA, 0x56, 0x02, 0xEB, 0x02, 0x13, 0xAA, 0x03, 0x7F, 0x64, 0xD2, 0x57, 0x23, 0x78, 0x96, 0x81, 0xFD,
+	0xDE, 0x9C, 0x4A, 0x81, 0x02, 0xE6, 0x52, 0xCB, 0x02, 0x28, 0x87, 0x67, 0xFF, 0x0E, 0x9D, 0xFE, 0x84, 0x4A, 0xC1, 0x5F, 0xCC, 0x6F, 0x19, 0xFD, 0xB5, 0x0C, 0xCB, 0xCC, 0xE2, 0x80, 0xDB, 0xF8,
+	0xFB, 0x18, 0xCE, 0x5C, 0x2F, 0x86, 0x98, 0x5D, 0x85, 0xC1, 0xDC, 0x75, 0x8C, 0xD1, 0xA7, 0xEB, 0x25, 0x9E, 0x13, 0x96, 0x0F, 0x69, 0xCE, 0xD0, 0xDE, 0xB8, 0x76, 0x18, 0x44, 0xC1, 0x2C, 0xD6,
+	0xB2, 0x79, 0xA4, 0x28, 0xC6, 0x61, 0x3C, 0xA4, 0x2B, 0x14, 0xC5, 0xA1, 0x79, 0xF6, 0xBC, 0xE1, 0xB4, 0x3B, 0xDD, 0xDE, 0x99, 0x2A, 0x11, 0xDF, 0x11, 0x9A, 0xEB, 0xF5, 0x66, 0xB3, 0xD3, 0x39,
+	0x53, 0x5F, 0x25, 0x03, 0x69, 0x32, 0x33, 0x75, 0x09, 0xE6, 0xA4, 0x11, 0xEB, 0xAD, 0x97, 0xFE, 0x17, 0x6F, 0xBB, 0x0A, 0x78, 0xF6, 0x34, 0x42, 0xE2, 0x41, 0x2E, 0x7B, 0x20, 0x7D, 0x08, 0x00,
+	0x1C, 0x1B, 0xD4, 0x32, 0xA9, 0x6B, 0x37, 0xC5, 0xB0, 0xCD, 0xC3, 0x45, 0xD2, 0xDB, 0x05, 0x97, 0x17, 0x23, 0x7E, 0xF7, 0x7C, 0x16, 0x04, 0xA0, 0xD7, 0xD6, 0xF6, 0xC0, 0x46, 0x06, 0x84, 0xEC,
+	0xA2, 0x14, 0x5D, 0x62, 0xD8, 0x08, 0x91, 0x66, 0x83, 0xA0, 0x24, 0x3C, 0xC0, 0x55, 0xD7, 0x9B, 0xBD, 0x4E, 0x23, 0x9D, 0x9D, 0x25, 0x0C, 0x3A, 0x7D, 0xFA, 0x9E, 0x24, 0x05, 0xDA, 0x94, 0xCE,
+	0x2D, 0xE1, 0xAD, 0x20, 0x11, 0x9B, 0xC3, 0x21, 0x76, 0x10, 0x62, 0xA6, 0x2F, 0xB0, 0x26, 0x21, 0x5D, 0x42, 0x81, 0xDE, 0x58, 0x50, 0x19, 0x4F, 0x8D, 0xF2, 0x03, 0x3A, 0x20, 0x63, 0x4C, 0xE3,
+	0xFF, 0x04, 0x63, 0x8D, 0xE5, 0xEB, 0xE6, 0x76, 0x5F, 0x3F, 0x3E, 0x7E, 0xB3, 0x70, 0x63, 0x72, 0x40, 0xD7, 0x6E, 0x9D, 0x7E, 0x78, 0xAA, 0xDE, 0x10, 0x96, 0x0D, 0xAD, 0xC0, 0x73, 0x52, 0x86,
+	0x9D, 0xAD, 0x68, 0x85, 0xC6, 0xBE, 0x15, 0x1A, 0x07, 0xD7, 0x65, 0x58, 0xA7, 0x1F, 0x60, 0x02, 0x2E, 0x47, 0xA6, 0x41, 0xE0, 0x59, 0x38, 0x14, 0x45, 0x63, 0x4B, 0xBE, 0x3F, 0x6C, 0xDC, 0x1A,
+	0xF7, 0xC6, 0xE7, 0x42, 0xA2, 0xAE, 0x32, 0x21, 0x0C, 0x96, 0x6D, 0xC5, 0x66, 0xBE, 0xA2, 0x74, 0xEE, 0x9D, 0xF6, 0x18, 0xF1, 0x7D, 0xEE, 0xC0, 0x86, 0x30, 0xAE, 0xD3, 0x4F, 0xE6, 0x46, 0xB0,
+	0x62, 0x52, 0xA3, 0x4E, 0xFF, 0xA4, 0x4F, 0xD9, 0x36, 0x00, 0x6E, 0xBB, 0x8E, 0x60, 0xDB, 0x60, 0x1C, 0x67, 0xEE, 0x23, 0x71, 0xA8, 0x45, 0xB6, 0xE2, 0x0E, 0x66, 0x07, 0xEB, 0xD0, 0x25, 0x90,
+	0xE7, 0x50, 0xF2, 0x24, 0xF9, 0x64, 0x03, 0x3B, 0xD9, 0x32, 0xF0, 0x83, 0x68, 0x85, 0x6D, 0xBA, 0x08, 0xAE, 0x3F, 0x0B, 0xC0, 0xEA, 0xE1, 0x53, 0xC1, 0x6C, 0x3A, 0xE3, 0x7A, 0x73, 0x79, 0x35,
+	0xBE, 0x99, 0x7E, 0x9A, 0x6E, 0x25, 0x71, 0xCB, 0xDC, 0x69, 0x93, 0xE9, 0xFB, 0xDB, 0x2F, 0xD7, 0xC3, 0xF1, 0x97, 0x37, 0x6F, 0x47, 0xEF, 0x6F, 0xC6, 0x79, 0xF7, 0x9A, 0x72, 0x1C, 0x4D, 0x6F,
+	0x26, 0xA5, 0x1E, 0x07, 0x87, 0xA0, 0x27, 0x21, 0x3E, 0x1D, 0x3C, 0x9C, 0xDE, 0x1D, 0xE8, 0x7E, 0x70, 0x03, 0x0F, 0x76, 0xDA, 0x9D, 0x76, 0x39, 0xF9, 0xED, 0x76, 0x38, 0x79, 0x3B, 0xFC, 0x75,
+	0x3C, 0x2D, 0x91, 0x41, 0xA8, 0x3F, 0x59, 0x61, 0xB0, 0xF1, 0x81, 0xEA, 0xE3, 0xF8, 0xAA, 0x3C, 0x7B, 0xD2, 0x73, 0x77, 0x7D, 0x57, 0x16, 0xCC, 0x21, 0x64, 0xB5, 0x72, 0xFD, 0xAF, 0xD0, 0xFB,
+	0x6A, 0x7C, 0x3B, 0xBE, 0xBF, 0x1E, 0x1E, 0x27, 0x78, 0x7F, 0xFB, 0xEB, 0xED, 0xDB, 0x8F, 0xB7, 0xE5, 0xA9, 0x09, 0xF5, 0xAF, 0x9B, 0xB7, 0xAF, 0xBE, 0xDC, 0x8C, 0x3F, 0x8C, 0x6F, 0xBE, 0xE8,
+	0x5B, 0x49, 0x7C, 0x6D, 0x14, 0x5F, 0x9B, 0xC5, 0xD7, 0x56, 0xF1, 0xB5, 0x5D, 0x7C, 0xED, 0xA4, 0xAF, 0x1F, 0xAE, 0x27, 0xD7, 0x57, 0x74, 0x4A, 0xC7, 0x8D, 0x56, 0x1E, 0x7E, 0x32, 0x5C, 0x3F,
+	0x09, 0x14, 0xDA, 0xFB, 0xFA, 0x7A, 0x34, 0x1A, 0xDF, 0xE6, 0x9D, 0x3C, 0xD6, 0x34, 0x06, 0x94, 0x1E, 0xE3, 0x37, 0xC4, 0x5F, 0x0B, 0xDE, 0x64, 0x3C, 0xFF, 0xA5, 0x47, 0x3F, 0xE0, 0x2C, 0x8F,
+	0xD5, 0x68, 0x81, 0x1D, 0xC8, 0x2B, 0x75, 0x09, 0x72, 0x12, 0xF8, 0x1F, 0xCF, 0xBF, 0x52, 0x5D, 0x4D, 0xFE, 0x6B, 0x4D, 0x48, 0x7A, 0x09, 0x36, 0x12, 0x70, 0x82, 0x6D, 0xDB, 0xFD, 0xE2, 0x64,
+	0x59, 0x32, 0xC4, 0x16, 0xD0, 0xAC, 0x21, 0x36, 0x39, 0x2E, 0x61, 0x08, 0x03, 0xBE, 0xDC, 0x28, 0x4E, 0x9C, 0x9F, 0x91, 0xEF, 0xA5, 0x44, 0x9A, 0x7D, 0x96, 0xAE, 0x9F, 0x44, 0x42, 0x9B, 0xA7,
+	0xCD, 0xC7, 0x34, 0x30, 0xD8, 0xFB, 0x1F, 0x55, 0x17, 0xF2, 0xC3, 0x23, 0x74, 0xD6, 0x45, 0x64, 0xD6, 0x05, 0xB1, 0x40, 0xD5, 0x25, 0xD5, 0x34, 0x4D, 0x2E, 0xAD, 0x56, 0xAB, 0x5F, 0x34, 0x54,
+	0xD5, 0xF2, 0x02, 0x70, 0xCF, 0xD4, 0x8D, 0x99, 0x58, 0x5D, 0x21, 0xFC, 0x39, 0x70, 0x12, 0x5B, 0x4E, 0xA4, 0xC9, 0x83, 0xA9, 0x2D, 0xC9, 0xCA, 0xED, 0x17, 0x7D, 0x7B, 0x1D, 0x46, 0xCC, 0x6F,
+	0x66, 0x78, 0xED, 0xC5, 0x79, 0xF2, 0x5E, 0xB8, 0x8E, 0x03, 0x5E, 0xBE, 0xBF, 0x6F, 0xA4, 0xE2, 0x97, 0x92, 0x68, 0x8F, 0x7E, 0x44, 0x60, 0xC4, 0xF4, 0xDA, 0x69, 0x4B, 0x58, 0xCF, 0x52, 0x02,
+	0xFA, 0xA1, 0xDC, 0x28, 0x1A, 0x79, 0xC1, 0xDB, 0x9B, 0x1D, 0x78, 0x4E, 0xF4, 0x58, 0x05, 0x2E, 0x63, 0x5E, 0xB4, 0xB9, 0xB8, 0xD9, 0x89, 0x26, 0xE3, 0xCB, 0x91, 0x88, 0x98, 0x28, 0x74, 0x00,
+	0xFD, 0x8D, 0xBA, 0xED, 0xD1, 0x2F, 0xB9, 0x2E, 0x8D, 0xEF, 0x56, 0xA6, 0x6E, 0xB5, 0x49, 0xCF, 0xFE, 0x5F, 0x2A, 0xD3, 0xF8, 0xA6, 0x36, 0x83, 0x5A, 0x52, 0x65, 0x0C, 0x6A, 0x49, 0x05, 0x45,
+	0xCB, 0x0D, 0x29, 0xF0, 0x81, 0xBB, 0x63, 0x22, 0x77, 0x26, 0xC9, 0x31, 0x20, 0x89, 0x60, 0x26, 0x33, 0x1C, 0xB2, 0x5E, 0x29, 0xD2, 0x33, 0xD3, 0x94, 0xCE, 0xE8, 0xBE, 0x37, 0x03, 0x27, 0x75,
+	0xCE, 0x14, 0x29, 0xE9, 0x91, 0x95, 0x3E, 0xAD, 0x68, 0x1C, 0xF7, 0x41, 0x72, 0x61, 0x68, 0x56, 0x26, 0x88, 0x8D, 0x29, 0x34, 0x47, 0x12, 0x9B, 0xD6, 0x44, 0x89, 0xBE, 0x1D, 0xAA, 0x6F, 0x56,
+	0x38, 0xBC, 0x28, 0x3B, 0x60, 0xCA, 0x22, 0x19, 0x24, 0xA8, 0x2E, 0x8E, 0x4F, 0x54, 0xB3, 0xBB, 0xF4, 0x53, 0x8C, 0x1B, 0xB6, 0xD3, 0x94, 0xCC, 0x84, 0x2E, 0xA0, 0xC2, 0x0A, 0x03, 0x7F, 0x7E,
+	0x31, 0xA0, 0xA6, 0xCD, 0x98, 0x67, 0x66, 0x6E, 0x75, 0x4A, 0x15, 0xD4, 0xC9, 0x8A, 0x09, 0x5D, 0x70, 0xF4, 0x16, 0x83, 0xAD, 0xA5, 0x7B, 0x82, 0xBD, 0xD8, 0x5D, 0x12, 0xE9, 0x26, 0x98, 0x43,
+	0xD6, 0x80, 0xA2, 0x8E, 0xF2, 0xB9, 0xA0, 0xD6, 0xE6, 0x33, 0xD6, 0x40, 0x9D, 0x1F, 0x55, 0xAA, 0x5D, 0xD2, 0x49, 0x6F, 0xFD, 0x09, 0xA5, 0x28, 0xD1, 0xF7, 0x28, 0x35, 0x80, 0x8D, 0xD5, 0x67,
+	0x6B, 0xC7, 0xCA, 0xD2, 0x05, 0x28, 0x88, 0xA8, 0x1E, 0xD0, 0x7A, 0x71, 0x4C, 0x2B, 0x41, 0x39, 0x36, 0x30, 0x58, 0x81, 0x2F, 0xB2, 0x6A, 0x17, 0x43, 0xF9, 0x9C, 0xCA, 0x24, 0x2C, 0x77, 0xA2,
+	0x70, 0x83, 0xC2, 0x09, 0x28, 0x96, 0x89, 0xE7, 0x25, 0x7A, 0x99, 0xA8, 0xCE, 0xDF, 0xE9, 0xF6, 0x9E, 0xBD, 0x7B, 0x38, 0x8A, 0x40, 0xA7, 0x1C, 0xD8, 0x30, 0xDE, 0x21, 0xFD, 0xE3, 0xB0, 0x19,
+	0x27, 0x50, 0x65, 0xDB, 0x31, 0x71, 0xDE, 0x04, 0xCE, 0xDA, 0x23, 0x51, 0x36, 0x24, 0x09, 0x0B, 0x74, 0x91, 0x12, 0x48, 0x09, 0x05, 0x14, 0xDD, 0x4E, 0x3E, 0xFC, 0x03, 0x09, 0x2D, 0x9A, 0xF1,
+	0x9E, 0x38, 0xD9, 0xFE, 0xF0, 0x8C, 0xC0, 0x90, 0xF4, 0xE2, 0xD0, 0x21, 0x45, 0xC0, 0xC7, 0x86, 0xB1, 0x4E, 0xEA, 0x12, 0xA5, 0xF9, 0xEE, 0xF0, 0x3A, 0x22, 0xC7, 0x06, 0xB1, 0xCE, 0x84, 0xBE,
+	0xC6, 0x94, 0xAC, 0x31, 0x33, 0xEE, 0xDB, 0x79, 0x05, 0xB5, 0xC4, 0x97, 0xE4, 0xA4, 0xA1, 0x18, 0x89, 0x1C, 0xFE, 0x0B, 0x6D, 0x67, 0x21, 0x99, 0x85, 0x24, 0x5A, 0x5C, 0xAD, 0x61, 0x87, 0xF0,
+	0x47, 0xEE, 0xC3, 0x59, 0xD1, 0x0D, 0x79, 0x09, 0xCC, 0xB7, 0x3C, 0x8E, 0x3B, 0x69, 0x00, 0x89, 0xDB, 0x27, 0x38, 0x81, 0xEB, 0xAF, 0xD6, 0x50, 0x63, 0xD2, 0x42, 0x03, 0x59, 0x8C, 0x11, 0x92,
+	0x1E, 0x30, 0x80, 0x26, 0x13, 0xDD, 0x73, 0xF6, 0x08, 0x12, 0x89, 0xED, 0xB9, 0xF6, 0x57, 0x13, 0x25, 0x13, 0xB2, 0x24, 0x21, 0x08, 0x7E, 0x31, 0x58, 0xE8, 0xB9, 0x77, 0xD1, 0xAE, 0x85, 0x9E,
+	0xF5, 0xAF, 0x92, 0x9C, 0xE1, 0xFA, 0xA2, 0x3A, 0x10, 0x61, 0xF1, 0x3A, 0x82, 0xB7, 0x72, 0x12, 0x69, 0xD5, 0xF7, 0x85, 0xE4, 0xC3, 0x58, 0x92, 0x06, 0x43, 0xB0, 0x2C, 0x9D, 0x0D, 0x4B, 0x77,
+	0xF4, 0x72, 0x18, 0xB1, 0x2A, 0x25, 0x8F, 0x18, 0xAA, 0x3A, 0x65, 0x94, 0x05, 0x02, 0x17, 0x80, 0x66, 0xFF, 0x2C, 0x12, 0xA4, 0x92, 0xEB, 0x1F, 0x0E, 0x04, 0x58, 0xF9, 0x8F, 0x00, 0x08, 0x82,
+	0x0D, 0x3A, 0x1E, 0x03, 0x1D, 0xA6, 0x44, 0x9A, 0xFF, 0xAA, 0x4F, 0x46, 0x04, 0x49, 0xC5, 0x63, 0x6B, 0x57, 0xE2, 0xC6, 0xEB, 0x98, 0x3C, 0xAC, 0x4E, 0x86, 0x8D, 0x5E, 0x3F, 0x30, 0x67, 0x29,
+	0x6C, 0xCE, 0x1E, 0x39, 0xCB, 0xCC, 0x17, 0xCA, 0xE5, 0x42, 0x69, 0xFD, 0x33, 0x1F, 0xDE, 0x27, 0xE7, 0xFE, 0xC3, 0x73, 0x97, 0x47, 0x9F, 0xA1, 0x9E, 0x7D, 0x42, 0x17, 0xD7, 0x3E, 0x3F, 0x1A,
+	0x03, 0x28, 0x21, 0xE1, 0x58, 0x1A, 0xE0, 0x74, 0x68, 0x99, 0x52, 0x5A, 0x80, 0xBF, 0x98, 0xEC, 0x58, 0x30, 0x32, 0x6A, 0x35, 0x0A, 0xEA, 0x61, 0x4F, 0x8B, 0x16, 0x74, 0x05, 0x43, 0xEC, 0x01,
+	0x4C, 0x5C, 0xA2, 0x8B, 0x43, 0xAD, 0x83, 0x1A, 0xBE, 0x38, 0x19, 0x2C, 0x25, 0x23, 0x0A, 0x78, 0x33, 0x0B, 0x3D, 0xB1, 0x2D, 0x21, 0x4D, 0x7B, 0x18, 0xE6, 0x11, 0xBC, 0x3A, 0x86, 0xF4, 0xEE,
+	0x11, 0x76, 0x6E, 0xC7, 0x33, 0x89, 0x7C, 0x36, 0x89, 0xD7, 0xFE, 0xB5, 0x4D, 0x86, 0x0B, 0x62, 0x7F, 0x05, 0xB8, 0x4A, 0x0B, 0xF5, 0x07, 0x90, 0x4F, 0xC9, 0x02, 0x86, 0x25, 0xA8, 0x22, 0x11,
+	0x4A, 0xA2, 0xC8, 0xCE, 0xDE, 0x1D, 0x1C, 0xE3, 0xAA, 0xBD, 0x04, 0xD2, 0xFA, 0x63, 0xBD, 0x81, 0x92, 0x13, 0x42, 0x43, 0xA2, 0xA5, 0x4A, 0x0D, 0x4A, 0x95, 0x81, 0x15, 0x16, 0x36, 0x91, 0xEF,
+	0x10, 0x70, 0x14, 0x7B, 0xD1, 0x69, 0xE9, 0x44, 0x8A, 0x6F, 0x88, 0xD6, 0xCA, 0x45, 0xA3, 0x75, 0xD2, 0x0F, 0x88, 0x35, 0xB1, 0xE3, 0xD5, 0x37, 0x8C, 0x26, 0x50, 0x7C, 0x43, 0xAC, 0xAE, 0x60,
+	0x31, 0xA8, 0xCF, 0x7E, 0x40, 0xAC, 0xCB, 0xE8, 0xC9, 0xB7, 0x27, 0x00, 0xC4, 0x49, 0x7C, 0x5A, 0xBA, 0x03, 0x84, 0xA7, 0x85, 0x6C, 0xD5, 0x45, 0xC8, 0x60, 0x48, 0x02, 0x83, 0x1F, 0x90, 0x17,
+	0xD4, 0x9E, 0x90, 0x10, 0xD2, 0xC7, 0x69, 0x69, 0xF7, 0xC8, 0x4E, 0xCB, 0xDA, 0x2D, 0xC9, 0x9A, 0x0D, 0xFF, 0x01, 0x49, 0x6F, 0xF1, 0x92, 0x38, 0x77, 0xEE, 0xEA, 0x1B, 0xA1, 0xB2, 0x47, 0xF6,
+	0x2D, 0xAB, 0x96, 0x44, 0xCD, 0xC6, 0xFF, 0x80, 0xA8, 0xAF, 0x08, 0xE0, 0x58, 0xD7, 0x3E, 0x2D, 0x68, 0x89, 0xE8, 0xB4, 0x98, 0x7A, 0x59, 0xCC, 0x64, 0xB4, 0x28, 0x64, 0x29, 0x55, 0x3D, 0xA4,
+	0xA0, 0xE3, 0x68, 0xB2, 0x4A, 0xB3, 0xE9, 0xA1, 0x2D, 0xF0, 0x98, 0xB6, 0xB0, 0x27, 0xDD, 0x80, 0x32, 0x9E, 0xAC, 0xE7, 0x4A, 0x15, 0xE0, 0xCD, 0x9F, 0xB4, 0x5A, 0xC6, 0xA7, 0x71, 0x90, 0x4F,
+	0xE3, 0xBB, 0xF9, 0x34, 0x0F, 0xF2, 0x69, 0x7E, 0x37, 0x9F, 0xD6, 0x41, 0x3E, 0xAD, 0xEF, 0xE6, 0xD3, 0x3E, 0xC8, 0xA7, 0x7D, 0x60, 0xC1, 0x60, 0xC7, 0x76, 0x57, 0x29, 0x30, 0x62, 0x57, 0x50,
+	0x7F, 0xC7, 0x0F, 0x98, 0xB7, 0xA2, 0x8B, 0x07, 0x80, 0x80, 0x77, 0x97, 0xEF, 0x27, 0xE3, 0x91, 0x39, 0xC3, 0x5E, 0x44, 0xFA, 0xB4, 0x61, 0x13, 0xB1, 0xB8, 0x67, 0xCF, 0xB0, 0xA2, 0x3E, 0x03,
+	0xA7, 0x42, 0xFF, 0xF0, 0xCD, 0xC8, 0xDC, 0xDE, 0xBE, 0xBD, 0x1D, 0x1B, 0x75, 0x35, 0x3D, 0xAD, 0x32, 0x1A, 0x2A, 0x4D, 0xB9, 0x46, 0x4B, 0xA5, 0x29, 0xCE, 0xE8, 0xAA, 0xC2, 0x49, 0x93, 0xD1,
+	0x69, 0xA9, 0x1F, 0xC7, 0x57, 0x93, 0xF1, 0xFD, 0x87, 0xF1, 0xBD, 0xA1, 0x37, 0xBA, 0x6A, 0x72, 0x50, 0x04, 0x65, 0x66, 0x47, 0xBD, 0xBD, 0x7C, 0x33, 0x1E, 0xD1, 0x73, 0x25, 0x40, 0x01, 0x8D,
+	0xD6, 0x8E, 0xCD, 0x90, 0xE9, 0x64, 0xEA, 0xFD, 0xD9, 0xDA, 0x67, 0xE7, 0x79, 0xD2, 0x3B, 0x19, 0x2B, 0xDB, 0x90, 0xC4, 0xEB, 0xD0, 0x97, 0x9C, 0xC0, 0x5E, 0x03, 0x28, 0x8D, 0xB5, 0x39, 0x89,
+	0xC7, 0x1E, 0xA1, 0x8F, 0x57, 0x4F, 0xD7, 0x0E, 0x50, 0xEC, 0x72, 0xFA, 0x89, 0x30, 0x80, 0x0E, 0xE6, 0x47, 0x98, 0x02, 0xC1, 0x58, 0xC6, 0xAA, 0xA5, 0x6C, 0x59, 0x1F, 0xB8, 0x29, 0xDD, 0x9B,
+	0x1D, 0xF3, 0x99, 0x25, 0x50, 0x7C, 0xE0, 0x14, 0xEE, 0x4C, 0xB6, 0x4C, 0x33, 0x2B, 0x33, 0x53, 0xAE, 0x32, 0x9B, 0x42, 0x4B, 0x3C, 0xDC, 0x34, 0x11, 0xF3, 0xF1, 0x97, 0xCC, 0x52, 0x46, 0x1C,
+	0xAE, 0x89, 0xB2, 0x23, 0xF0, 0xB8, 0x2D, 0x92, 0xC9, 0xD6, 0x4B, 0x84, 0x0C, 0x4E, 0xAB, 0xEC, 0x84, 0xC9, 0x2E, 0x05, 0x71, 0x5C, 0x30, 0x7B, 0x48, 0x2F, 0x29, 0x2B, 0xA6, 0x28, 0xCF, 0xEB,
+	0x43, 0x24, 0x05, 0x8A, 0xE1, 0x69, 0x2B, 0x45, 0x57, 0x4F, 0x43, 0xEA, 0x5C, 0x34, 0x11, 0x15, 0xAD, 0x35, 0xFC, 0x20, 0xDB, 0x2A, 0xA8, 0x46, 0xED, 0x8F, 0x4D, 0xE0, 0x63, 0x2B, 0x80, 0x3B,
+	0x43, 0x99, 0xBE, 0x5B, 0x66, 0xBD, 0x6F, 0x0D, 0xB0, 0xE6, 0x11, 0x7F, 0x1E, 0x2F, 0xFA, 0x56, 0xA5, 0xA2, 0x6C, 0xF1, 0xEF, 0xD6, 0x67, 0x6E, 0xD1, 0x4C, 0x33, 0x47, 0xD0, 0xE6, 0xDA, 0x8F,
+	0x9B, 0x8D, 0x69, 0x30, 0x89, 0x43, 0x41, 0x20, 0x78, 0x03, 0x00, 0xA8, 0xCD, 0xC2, 0x60, 0x39, 0x5C, 0xE0, 0x70, 0x18, 0x38, 0x44, 0x96, 0xF1, 0xC5, 0x45, 0xA3, 0xA5, 0xFC, 0xD4, 0x68, 0xB7,
+	0x55, 0xFA, 0xAC, 0x77, 0xF2, 0xE7, 0x2E, 0x7F, 0xC4, 0xF4, 0xAF, 0x52, 0xE0, 0xAD, 0x77, 0xFE, 0x2C, 0xEF, 0x23, 0x3C, 0xA0, 0x28, 0x76, 0x26, 0x8B, 0x20, 0x8C, 0xB9, 0x45, 0x93, 0x05, 0xC5,
+	0x9A, 0x9D, 0x8C, 0xBD, 0x8C, 0x65, 0x4B, 0x19, 0x0C, 0xBA, 0x4A, 0xA5, 0xD8, 0x56, 0xD1, 0x4B, 0x4C, 0x40, 0x98, 0x53, 0x2C, 0x7E, 0xD6, 0x3B, 0xE7, 0xE7, 0xE7, 0x0D, 0xD0, 0xAA, 0x22, 0xEF,
+	0x71, 0xFA, 0xB9, 0xD3, 0x6E, 0x37, 0x0F, 0xF4, 0x34, 0x94, 0x9F, 0x21, 0x34, 0xF6, 0xA6, 0x6E, 0x96, 0xA6, 0xBE, 0x81, 0x3A, 0xB7, 0x30, 0xF7, 0xDE, 0xE4, 0xE7, 0x5A, 0xA3, 0xDE, 0x3E, 0x6F,
+	0xF7, 0x5A, 0xF5, 0xE6, 0x79, 0xAF, 0x71, 0xDE, 0x6B, 0x91, 0xCA, 0x11, 0x49, 0x1A, 0x5D, 0xBD, 0x75, 0xDE, 0xEA, 0x9D, 0x77, 0xCE, 0xF5, 0x7A, 0xA7, 0x7D, 0x58, 0x26, 0xBD, 0xDE, 0xEB, 0xB5,
+	0x75, 0xBD, 0xD3, 0x00, 0x8D, 0x0E, 0x50, 0x34, 0x95, 0x9F, 0x5B, 0x8D, 0x5E, 0xAB, 0xD7, 0x39, 0x6F, 0xF4, 0xF6, 0x85, 0x6F, 0x9D, 0x32, 0x45, 0xFB, 0xA8, 0x29, 0x3A, 0x87, 0x4D, 0x71, 0x2E,
+	0x98, 0x62, 0xC2, 0x2E, 0x9F, 0x96, 0x4B, 0xEC, 0x3B, 0xB2, 0xA5, 0xDA, 0xDC, 0x85, 0x89, 0x29, 0x78, 0x89, 0xA5, 0x54, 0xEC, 0x3E, 0x77, 0x6C, 0x9F, 0x6C, 0xA8, 0xFF, 0x74, 0x2F, 0x43, 0x80,
+	0xF6, 0x32, 0x49, 0x5C, 0x3A, 0x77, 0x75, 0x07, 0x5C, 0xDD, 0x19, 0xA4, 0xED, 0x7D, 0x87, 0xBB, 0xBA, 0xF3, 0xD9, 0x24, 0xA2, 0x00, 0x8E, 0xB2, 0x4B, 0xB2, 0xA4, 0x16, 0xC1, 0xEC, 0x85, 0x48,
+	0x62, 0x85, 0x35, 0xAD, 0xAB, 0x65, 0x08, 0xD4, 0xD7, 0xB2, 0x50, 0x68, 0xA9, 0x08, 0x29, 0xFD, 0x4B, 0x07, 0xD6, 0x6D, 0x2E, 0xA3, 0xDF, 0x87, 0x37, 0xE3, 0xCB, 0xFB, 0xF1, 0xE8, 0x33, 0x12,
+	0xC6, 0xBE, 0x76, 0x1D, 0xF2, 0xDE, 0xE7, 0x9B, 0xBE, 0x23, 0xB3, 0xC4, 0xF3, 0x4E, 0xDE, 0x03, 0xE8, 0x8A, 0xC6, 0xF6, 0x71, 0x48, 0x56, 0x3C, 0x2B, 0xC3, 0x3C, 0x10, 0xBD, 0xA8, 0x74, 0x73,
+	0x00, 0xD3, 0x25, 0x39, 0x86, 0x73, 0x29, 0x00, 0xE9, 0x23, 0x2C, 0x84, 0xEB, 0x85, 0xF2, 0xF0, 0x02, 0xE0, 0x3D, 0x26, 0x41, 0x7E, 0xFD, 0x50, 0x1E, 0x7E, 0x08, 0x91, 0x1E, 0xE1, 0xB2, 0x7F,
+	0x49, 0x51, 0x66, 0xB6, 0x0F, 0x18, 0x8F, 0xB0, 0xCA, 0x6F, 0x32, 0xCA, 0x2C, 0xF6, 0x91, 0xDC, 0x11, 0x16, 0xC2, 0x95, 0x47, 0xCE, 0x23, 0x5F, 0xB1, 0x29, 0x5B, 0x2B, 0x76, 0x2E, 0x72, 0x4F,
+	0x22, 0x48, 0xB7, 0xB0, 0x6A, 0xC9, 0x8E, 0xFA, 0x8C, 0x7F, 0xF7, 0xA9, 0x13, 0x88, 0xA7, 0x2A, 0xAA, 0xCC, 0x3B, 0x5E, 0x22, 0x3E, 0x02, 0x36, 0x03, 0xD6, 0x8D, 0x14, 0xA5, 0xFF, 0xAE, 0x48,
+	0x0A, 0x32, 0xA5, 0xD9, 0xDA, 0x4C, 0x07, 0xA5, 0xC7, 0xA9, 0x30, 0x2C, 0x3D, 0x97, 0xC9, 0xC5, 0xD9, 0xC7, 0x8B, 0xB6, 0x8A, 0x79, 0x44, 0x38, 0xE6, 0x3B, 0xC8, 0xE9, 0x1A, 0x05, 0x7E, 0x11,
+	0xF8, 0x2D, 0x60, 0xBF, 0x3E, 0x6B, 0x48, 0xB5, 0x7E, 0x26, 0x8B, 0xAF, 0x4A, 0x9F, 0x27, 0x7E, 0xB1, 0xED, 0xA5, 0xAC, 0x0F, 0x06, 0xD9, 0xDE, 0xAC, 0x18, 0x7A, 0x5F, 0x0C, 0x3D, 0x47, 0x2D,
+	0x44, 0x1C, 0xE8, 0x02, 0xD6, 0x13, 0x11, 0xA1, 0xCA, 0xCD, 0xDA, 0xCF, 0x50, 0x4C, 0xC6, 0x0A, 0x44, 0xEC, 0xC3, 0xB2, 0x60, 0x6D, 0x15, 0x32, 0x58, 0x33, 0xE2, 0x47, 0xFF, 0x10, 0x79, 0xA5,
+	0x16, 0x99, 0x2D, 0x1F, 0xD6, 0xE8, 0xCF, 0x03, 0xEE, 0xC2, 0x60, 0x85, 0xE7, 0xAC, 0x7E, 0xA7, 0x84, 0xA5, 0x26, 0x59, 0x5C, 0xA4, 0x6C, 0x46, 0x66, 0x8C, 0x1C, 0x5D, 0xD8, 0x6C, 0x6D, 0xCA,
+	0x27, 0x6C, 0x2A, 0x12, 0x30, 0x15, 0xAA, 0xD8, 0x5C, 0x93, 0x22, 0xE2, 0x4D, 0x75, 0x49, 0x77, 0x47, 0x9A, 0x3E, 0x2C, 0x40, 0x2B, 0xD6, 0xC0, 0xEC, 0xF4, 0x2B, 0x15, 0x2B, 0x71, 0x9E, 0xFC,
+	0x26, 0x0A, 0x55, 0x2C, 0x15, 0x3A, 0xED, 0x97, 0x88, 0x5F, 0xA8, 0xE4, 0x08, 0xA0, 0x14, 0xF3, 0x05, 0x9B, 0x02, 0xD4, 0xD2, 0x28, 0xD2, 0x12, 0x4D, 0x5B, 0x58, 0x83, 0xFF, 0xAE, 0xDD, 0x92,
+	0x5C, 0x85, 0xD5, 0x59, 0x9A, 0x56, 0x2D, 0x13, 0x21, 0x3A, 0xE5, 0xAC, 0x00, 0x87, 0x00, 0xBA, 0x14, 0xD2, 0x9C, 0x00, 0x62, 0xCF, 0xD2, 0x7B, 0xCE, 0x33, 0xE9, 0x02, 0x8C, 0x89, 0x2B, 0x68,
+	0x50, 0xCB, 0x50, 0x2A, 0xA4, 0x43, 0xBE, 0x73, 0x51, 0xE9, 0xB8, 0x7F, 0xA7, 0x7B, 0xD9, 0x8E, 0x27, 0x71, 0x24, 0x09, 0xF7, 0x82, 0xA8, 0xCF, 0xFD, 0x58, 0xB6, 0x07, 0x66, 0xD1, 0x0C, 0x2F,
+	0x39, 0x1D, 0xBB, 0xE5, 0xBB, 0x86, 0x40, 0x35, 0xF8, 0x3B, 0xBF, 0xD7, 0x83, 0x59, 0xA2, 0x8D, 0x1B, 0xDB, 0x0B, 0x70, 0xE5, 0xAD, 0x0D, 0xCE, 0x2F, 0x35, 0x8C, 0x3D, 0xCE, 0x56, 0x48, 0xF0,
+	0xD7, 0x3E, 0xEB, 0x6D, 0x95, 0x7A, 0x1B, 0x85, 0xDE, 0x6E, 0xA9, 0xB7, 0x59, 0xE8, 0xD5, 0x3B, 0xA5, 0xEE, 0x56, 0xA1, 0xBB, 0x59, 0x9E, 0xB9, 0x9D, 0x76, 0x27, 0xB7, 0x5D, 0x47, 0x04, 0xDB,
+	0x25, 0x0A, 0xE0, 0xBF, 0x35, 0x1B, 0xE7, 0x9D, 0x6E, 0xA2, 0x06, 0xF5, 0x8E, 0x0C, 0x80, 0xC3, 0xCA, 0x94, 0x37, 0x00, 0x71, 0x66, 0x4A, 0xCB, 0x10, 0x3A, 0xD0, 0x89, 0x59, 0xBE, 0x4C, 0xC3,
+	0xE0, 0x3B, 0xE5, 0x25, 0xA4, 0xF2, 0x32, 0x8D, 0x88, 0xED, 0x81, 0xF4, 0x40, 0xBE, 0x2E, 0x8F, 0xC8, 0xE1, 0x3F, 0xD0, 0x0B, 0x49, 0xB9, 0x4C, 0x97, 0x16, 0x06, 0x40, 0x55, 0xBC, 0x4C, 0xDE,
+	0xA3, 0xCC, 0xCB, 0x06, 0xA0, 0x15, 0x73, 0x74, 0xC9, 0x9E, 0xD0, 0x5B, 0xBC, 0x75, 0x4E, 0x2D, 0x7A, 0xCA, 0x67, 0x21, 0x58, 0x2B, 0xA4, 0xE2, 0x54, 0x10, 0x77, 0x5A, 0x99, 0x82, 0x86, 0x11,
+	0x8E, 0x21, 0xB7, 0x6B, 0x71, 0x70, 0x13, 0xD8, 0xD8, 0x23, 0x53, 0x77, 0x49, 0x38, 0xE4, 0x94, 0x15, 0xA5, 0x82, 0x68, 0xA2, 0x98, 0x95, 0x7C, 0x3B, 0x8F, 0xA3, 0xEC, 0x52, 0x6A, 0x9B, 0x41,
+	0xF2, 0xB4, 0xA6, 0x5B, 0x40, 0x98, 0x7B, 0x64, 0x98, 0xA7, 0xC9, 0x0C, 0x20, 0x8C, 0x23, 0x7A, 0x5A, 0xE8, 0x46, 0x0B, 0x98, 0x23, 0xAD, 0xC3, 0x80, 0x99, 0xA6, 0x69, 0xE0, 0xD0, 0x09, 0xFA,
+	0x60, 0x70, 0x86, 0xEE, 0x86, 0xEC, 0x4D, 0x46, 0x1B, 0x7A, 0x40, 0x89, 0x2A, 0x1B, 0xA6, 0x94, 0xE6, 0x81, 0xA4, 0x6C, 0x08, 0xBD, 0x28, 0xA9, 0xA0, 0x5A, 0x3E, 0x4E, 0xB3, 0x5C, 0x1F, 0x87,
+	0x4F, 0xEC, 0x77, 0x39, 0x08, 0x53, 0x28, 0x64, 0xAD, 0x67, 0x33, 0x12, 0xA2, 0x8C, 0x20, 0xF0, 0x83, 0x15, 0xF1, 0xCD, 0x54, 0x05, 0x0A, 0xB4, 0xF3, 0x5A, 0x90, 0xD6, 0x36, 0x99, 0x9C, 0x59,
+	0x33, 0x97, 0x2C, 0x24, 0xB0, 0xBB, 0xF0, 0x4C, 0x0A, 0xE3, 0x00, 0x04, 0xED, 0x04, 0x9E, 0xB6, 0x17, 0x44, 0xE4, 0x08, 0x53, 0x5E, 0x60, 0xA6, 0x5C, 0x87, 0x99, 0xC2, 0x12, 0x8C, 0x89, 0x19,
+	0x6F, 0x91, 0xD3, 0x92, 0x44, 0x11, 0x9E, 0x17, 0x79, 0xF1, 0x04, 0x45, 0x4D, 0xF2, 0x8B, 0xEB, 0x11, 0x8A, 0x90, 0x49, 0x08, 0x09, 0xD5, 0xD2, 0x92, 0x1B, 0xC4, 0x8C, 0x36, 0x29, 0x73, 0xE6,
+	0xA6, 0xA3, 0xC1, 0xCA, 0x40, 0x75, 0xA4, 0x81, 0xD4, 0xF4, 0xAE, 0x99, 0x95, 0xBC, 0x66, 0x5E, 0x1B, 0xCC, 0xD5, 0x3A, 0xCF, 0xF1, 0xB3, 0x42, 0x63, 0x83, 0xA5, 0x5D, 0xD9, 0xFE, 0x89, 0x47,
+	0xA3, 0x69, 0x26, 0x51, 0x99, 0x08, 0x6F, 0xAB, 0x73, 0x2D, 0x5A, 0x5B, 0x11, 0x77, 0x8F, 0x96, 0xA2, 0xCE, 0x20, 0xA9, 0x82, 0x18, 0xE0, 0x77, 0xCE, 0x65, 0x74, 0xC5, 0x4C, 0x9F, 0xF8, 0x0E,
+	0x15, 0xF6, 0xCA, 0x0B, 0x2C, 0xF9, 0x77, 0xCC, 0x76, 0xE6, 0xCF, 0x8A, 0x98, 0x7F, 0xF7, 0x6C, 0xB9, 0x3D, 0x89, 0x06, 0xB9, 0x05, 0x8F, 0x43, 0xBD, 0xAC, 0xFF, 0x08, 0x96, 0xCB, 0xFA, 0x4F,
+	0x83, 0xB5, 0x8C, 0xEC, 0x14, 0x0C, 0xCB, 0x88, 0x4E, 0x01, 0x2D, 0x46, 0x94, 0xAB, 0xBB, 0x17, 0x0B, 0x34, 0x61, 0x1F, 0xDF, 0x7B, 0x8F, 0xE1, 0x0B, 0xEE, 0x06, 0x59, 0xA4, 0x11, 0x5E, 0xF9,
+	0xFE, 0x02, 0x85, 0xE1, 0x1D, 0xBD, 0xBD, 0x96, 0x6D, 0x8D, 0x5E, 0x4E, 0x7D, 0xAA, 0x66, 0x14, 0xF4, 0x96, 0x59, 0xE3, 0x57, 0x1B, 0x37, 0xF4, 0x67, 0x79, 0x9C, 0xE0, 0xB7, 0x83, 0x04, 0xD3,
+	0x60, 0xC5, 0x16, 0xDF, 0xFA, 0xE9, 0x27, 0xEB, 0x99, 0xE9, 0xAF, 0x3D, 0x0F, 0x1E, 0x34, 0x17, 0x40, 0xE3, 0xDE, 0x45, 0x5F, 0x56, 0x4B, 0x17, 0xC5, 0x54, 0xFA, 0x29, 0x1A, 0xDB, 0x1F, 0x41,
+	0x2B, 0xF5, 0x2B, 0x7A, 0x35, 0x0E, 0xBE, 0x31, 0xF4, 0xE8, 0x4F, 0xE7, 0xEE, 0x81, 0x00, 0x7C, 0x18, 0x27, 0xA5, 0x36, 0xBD, 0xFA, 0x00, 0xAF, 0xA5, 0x5F, 0x15, 0xB4, 0x7A, 0x44, 0x59, 0x07,
+	0xEC, 0xE2, 0xD4, 0x9B, 0x83, 0x55, 0xB1, 0x39, 0x2D, 0xCD, 0x11, 0xFB, 0xFD, 0x06, 0xE2, 0xE7, 0x11, 0x87, 0xC5, 0x2F, 0xC3, 0x20, 0x41, 0xFC, 0xA2, 0xFD, 0x05, 0x05, 0xF6, 0xC6, 0xFC, 0x3F,
+	0x15, 0x10, 0xAF, 0x3B, 0x95, 0xAD, 0x50, 0x86, 0x9D, 0x1A, 0x54, 0x40, 0xDB, 0xDB, 0x03, 0x68, 0x7E, 0x07, 0xFF, 0x60, 0xA8, 0xBD, 0x87, 0xB1, 0xCA, 0x2D, 0x1C, 0x63, 0xD9, 0xFB, 0x18, 0x6B,
+	0xAF, 0x09, 0x28, 0x93, 0x82, 0x9D, 0x7B, 0x6C, 0x19, 0xBE, 0xB3, 0x5F, 0x52, 0xF2, 0xC2, 0x1E, 0xFF, 0x8E, 0xCA, 0xBF, 0x97, 0x40, 0x9F, 0x4D, 0xEB, 0x25, 0xA2, 0xBF, 0x07, 0x03, 0x98, 0x33,
+	0x0F, 0xC9, 0x13, 0xDA, 0xF5, 0x07, 0x35, 0x7E, 0xA2, 0x47, 0xCF, 0xFD, 0xA8, 0xB3, 0xB2, 0x9F, 0x50, 0xD0, 0xDF, 0xA2, 0xFF, 0x07, 0x36, 0xEF, 0xCE, 0xC3, 0x0F, 0x2F, 0x00, 0x00
 };
+void ILibDefaultLogger_WebSocket_OnReceive(struct ILibWebServer_Session *sender, int InterruptFlag, struct packetheader *header, char *bodyBuffer, int *beginPointer, int endPointer, ILibWebServer_DoneFlag done)
+{
+	ILibRemoteLogging logger = ILibChainGetLogger(ILibTransportChain(sender));
+
+	if (logger == NULL) { return; }
+	if (done == ILibWebServer_DoneFlag_Done)
+	{
+		// Web Socket Disconnected
+		ILibRemoteLogging_DeleteUserContext(logger, sender); 
+		return;
+	}
+	if (done != ILibWebServer_DoneFlag_NotDone) { *beginPointer = endPointer; return; } // We're only going to handle the case where we receive a full fragment
+
+	if (ILibRemoteLogging_Dispatch(logger, bodyBuffer, endPointer, sender) < 0)
+	{
+		ILibWebServer_WebSocket_Close(sender);
+	}
+
+	*beginPointer = endPointer;
+}
+void ILibDefaultLogger_Session_OnReceive(struct ILibWebServer_Session *sender, int InterruptFlag, struct packetheader *header, char *bodyBuffer, int *beginPointer, int endPointer, ILibWebServer_DoneFlag done)
+{
+	ILibRemoteLogging logger = ILibChainGetLogger(ILibTransportChain(sender));
+	if (done != ILibWebServer_DoneFlag_Done || logger == NULL) { return; }
+
+	switch (ILibWebServer_WebSocket_GetDataType(sender))
+	{
+	case ILibWebServer_WebSocket_DataType_UNKNOWN:
+		if (header->DirectiveLength == 3 && strncasecmp(header->Directive, "GET", 3) == 0)
+		{
+			if (header->DirectiveObjLength == 1 && strncasecmp(header->DirectiveObj, "/", 1) == 0)
+			{
+				int flen;
+				char* f;
+
+				flen = ILibReadFileFromDiskEx(&f, "web\\index.html");
+				if (flen == 0)
+				{
+					ILibWebServer_StreamHeader_Raw(sender, 200, "OK", "\r\nContent-Type: text/html\r\nContent-Encoding: gzip", ILibAsyncSocket_MemoryOwnership_STATIC);
+					ILibWebServer_StreamBody(sender, (char*)ILibDefaultLogger_HTML, sizeof(ILibDefaultLogger_HTML), ILibAsyncSocket_MemoryOwnership_STATIC, ILibWebServer_DoneFlag_Done);
+				}
+				else
+				{
+					ILibWebServer_StreamHeader_Raw(sender, 200, "OK", "\r\nContent-Type: text/html", ILibAsyncSocket_MemoryOwnership_STATIC);
+					ILibWebServer_StreamBody(sender, f, flen, ILibAsyncSocket_MemoryOwnership_CHAIN, ILibWebServer_DoneFlag_Done);
+				}
+			}
+			else
+			{
+				ILibWebServer_StreamHeader_Raw(sender, 404, "Not Found", NULL, ILibAsyncSocket_MemoryOwnership_STATIC);
+				ILibWebServer_StreamBody(sender, NULL, 0, ILibAsyncSocket_MemoryOwnership_STATIC, ILibWebServer_DoneFlag_Done);
+			}
+		}
+		else
+		{
+			ILibWebServer_StreamHeader_Raw(sender, 400, "Bad Request", NULL, ILibAsyncSocket_MemoryOwnership_STATIC);
+			ILibWebServer_StreamBody(sender, NULL, 0, ILibAsyncSocket_MemoryOwnership_STATIC, ILibWebServer_DoneFlag_Done);
+		}
+		break;
+	case ILibWebServer_WebSocket_DataType_REQUEST:
+		if (ILibWebServer_IsCrossSiteRequest(sender) == NULL)
+		{
+			sender->OnReceive = &ILibDefaultLogger_WebSocket_OnReceive;
+			ILibWebServer_UpgradeWebSocket(sender, 8192);
+		}
+		else
+		{
+			ILibWebServer_StreamHeader_Raw(sender, 400, "Bad Request", NULL, ILibAsyncSocket_MemoryOwnership_STATIC);
+			ILibWebServer_StreamBody(sender, NULL, 0, ILibAsyncSocket_MemoryOwnership_STATIC, ILibWebServer_DoneFlag_Done);
+		}
+		break;
+	default:
+		ILibWebServer_StreamHeader_Raw(sender, 400, "Bad Request", NULL, ILibAsyncSocket_MemoryOwnership_STATIC);
+		ILibWebServer_StreamBody(sender, NULL, 0, ILibAsyncSocket_MemoryOwnership_STATIC, ILibWebServer_DoneFlag_Done);
+		break;
+	}
+}
+void ILibDefaultLogger_OnSession(struct ILibWebServer_Session *SessionToken, void *User)
+{
+	SessionToken->OnReceive = &ILibDefaultLogger_Session_OnReceive;
+}
+void ILibDefaultLogger_OnWrite(ILibRemoteLogging module, char* data, int dataLen, void *userContext)
+{
+	ILibTransport_Send(userContext, data, dataLen, ILibTransport_MemoryOwnership_USER, ILibTransport_DoneState_COMPLETE);
+}
+unsigned short ILibStartDefaultLogger(void* chain, unsigned short portNumber)
+{
+	((ILibBaseChain*)chain)->ChainLogger = ILibRemoteLogging_Create(ILibDefaultLogger_OnWrite);
+	((ILibBaseChain*)chain)->LoggingWebServer = ILibWebServer_Create(chain, 5, portNumber, ILibDefaultLogger_OnSession, NULL);
+	return(ILibWebServer_GetPortNumber(((ILibBaseChain*)chain)->LoggingWebServer));
+}
+#endif
+
 
 //
 // Do not Modify this method.
@@ -1029,26 +1432,8 @@ void ILibChain_SafeRemoveSink(void *object)
 {
 	struct ILibBaseChain_SafeData *data = (struct ILibBaseChain_SafeData*)object;
 	struct ILibBaseChain *chain = (struct ILibBaseChain*)data->Chain;
-	struct ILibBaseChain *prev = NULL;
 
-	//
-	// Add link to the end of the chain (Linked List)
-	//
-	while (chain->Next != NULL && chain->Object != data->Object)
-	{
-		prev = chain;
-		chain = chain->Next;
-	}
-	if (chain != NULL && chain->Object == data->Object)
-	{
-		if (prev != NULL) prev->Next = chain->Next;
-		if (((struct ILibChain*)chain->Object)->Destroy != NULL)
-		{
-			((struct ILibChain*)chain->Object)->Destroy(chain->Object);
-		}
-		free(chain->Object);
-		free(chain);
-	}	
+	ILibLinkedList_Remove_ByData(chain->Links, data->Object);
 	free(data);
 }
 /*! \fn void ILibChain_SafeAdd(void *chain, void *object)
@@ -1110,8 +1495,9 @@ void *ILibCreateChain()
 	if ((RetVal = (struct ILibBaseChain*)malloc(sizeof(struct ILibBaseChain))) == NULL) ILIBCRITICALEXIT(254);
 	memset(RetVal,0,sizeof(struct ILibBaseChain));
 
-	RetVal->Object = NULL;
-	RetVal->Next = NULL;
+	RetVal->Links = ILibLinkedList_Create();
+	RetVal->LinksPendingDelete = ILibLinkedList_Create();
+
 	RetVal->TerminateFlag = 0;
 #if defined(WIN32) || defined(_WIN32_WCE)
 	RetVal->Terminate = socket(AF_INET, SOCK_DGRAM, 0);
@@ -1125,9 +1511,6 @@ void *ILibCreateChain()
 
 	RetVal->Timer = ILibCreateLifeTime(RetVal);
 
-#if defined(__SYMBIAN32__)
-	ILibSocketWrapper_Create();
-#endif
 	return(RetVal);
 }
 
@@ -1141,19 +1524,10 @@ void *ILibCreateChain()
 */
 void ILibAddToChain(void *Chain, void *object)
 {
-	struct ILibBaseChain *chain = (struct ILibBaseChain*)Chain;
-
 	//
 	// Add link to the end of the chain (Linked List)
 	//
-	while (chain->Next!=NULL) chain = chain->Next;
-	if (chain->Object!=NULL)
-	{
-		if ((chain->Next = (struct ILibBaseChain*)malloc(sizeof(struct ILibBaseChain))) == NULL) ILIBCRITICALEXIT(254);
-		chain = chain->Next;
-	}
-	chain->Object = object;
-	chain->Next = NULL;
+	ILibLinkedList_AddTail(((ILibBaseChain*)Chain)->Links, object);
 }
 
 // Return the base timer for this chain. Most of the time, new timers probably don't need to be created
@@ -1185,9 +1559,7 @@ void ILibForceUnBlockChain(void *Chain)
 	{
 		c->Terminate = (SOCKET)~0;
 		closesocket(temp);
-	}
-#elif defined(__SYMBIAN32__)
-	ILibChainAdaptor_ForceUnBlock(c->SymbianAdaptor);	
+	}	
 #else
 	//
 	// Writing data on the pipe will trigger the select on Posix
@@ -1200,121 +1572,7 @@ void ILibForceUnBlockChain(void *Chain)
 #endif
 	sem_post(&ILibChainLock);
 }
-void ILibChain_SubChain_Destroy(void *object)
-{
-	struct ILibChain_SubChain *c = (struct ILibChain_SubChain*)object;
-	struct ILibBaseChain *baseChain,*temp;
 
-	//
-	// Now we actually free the chain
-	//
-	baseChain = (struct ILibBaseChain*)c->subChain;
-#if !defined(WIN32) && !defined(_WIN32_WCE) && !defined(__SYMBIAN32__)
-	//
-	// Free the pipe resources
-	//
-	if (baseChain!=NULL)
-	{
-		if (baseChain->TerminateReadPipe!=NULL)
-		{
-			fclose(baseChain->TerminateReadPipe);
-		}
-		if (baseChain->TerminateWritePipe!=NULL)
-		{
-			fclose(baseChain->TerminateWritePipe);
-		}
-	}
-#endif
-	while (baseChain != NULL)
-	{
-		temp = baseChain->Next;
-		free(baseChain);
-		baseChain = temp;
-	}
-#ifdef WIN32
-	WSACleanup();
-#endif
-	if (ILibChainLock_RefCounter==1)
-	{
-		sem_destroy(&ILibChainLock);
-	}
-	--ILibChainLock_RefCounter;	
-}
-/*! \fn void ILibChain_SafeAdd_SubChain(void *chain, void *subChain)
-\brief Dynamically add an entire chain, as a subchain to an existing chain that is already running
-\par
-\b Note: After adding a subchain, you cannot add more links/chains to the subchain. You can however, continue to
-add more links/subchains to the parent chain.
-\param chain The chain to add the subchain to
-\param subChain The subchain to add to the chain
-*/
-void ILibChain_SafeAdd_SubChain(void *chain, void *subChain)
-{
-	struct ILibBaseChain* newChain = (struct ILibBaseChain*)subChain;
-	struct ILibChain_SubChain *c;
-
-	if ((c = (struct ILibChain_SubChain*)malloc(sizeof(struct ILibChain_SubChain))) == NULL) ILIBCRITICALEXIT(254);
-	memset(c,0,sizeof(struct ILibChain_SubChain));
-	c->Destroy = &ILibChain_SubChain_Destroy;
-
-#if defined(__SYMBIAN32__)
-	newChain->SymbianAdaptor = ((struct ILibBaseChain*)chain)->SymbianAdaptor;
-#endif
-	newChain->RunningFlag = ((struct ILibBaseChain*)chain)->RunningFlag;
-
-	newChain->Reserved = c;
-	while (newChain!=NULL && newChain->Object!=NULL)
-	{
-		ILibChain_SafeAdd(chain,newChain->Object);
-		newChain = newChain->Next;
-	}
-
-	ILibChain_SafeAdd(chain,c);
-}
-/*! \fn void ILibChain_SafeRemove_SubChain(void *chain, void *subChain)
-\brief Dynamically removes a subchain from an existing chain that is already running
-\param chain The chain to remove the subchain from
-\param subChain The subchain to remove
-*/
-void ILibChain_SafeRemove_SubChain(void *chain, void *subChain)
-{
-	struct ILibBaseChain* newChain = (struct ILibBaseChain*)subChain;
-	void *c = newChain->Reserved;
-	void *temp;
-
-#if defined(WIN32)
-	if (newChain->Terminate!=~0)
-	{
-		closesocket(newChain->Terminate);
-		newChain->Terminate = (SOCKET)~0;
-	}
-#endif
-#if !defined(WIN32) && !defined(_WIN32_WCE)
-	//
-	// Free the pipe resources
-	//
-	if (newChain->TerminateReadPipe!=NULL)
-	{
-		fclose(newChain->TerminateReadPipe);
-	}
-	if (newChain->TerminateWritePipe!=NULL)
-	{
-		fclose(newChain->TerminateWritePipe);
-	}
-#endif
-
-	while (newChain != NULL && newChain->Object != NULL)
-	{
-		ILibChain_SafeRemove(chain,newChain->Object);
-		temp = newChain;
-		newChain = newChain->Next;
-		free(temp);
-	}
-	if (c != NULL)
-	{
-		ILibChain_SafeRemove(chain,c);
-	}
-}
 /*! \fn void ILibChain_DestroyEx(void *subChain)
 \brief Destroys a chain or subchain that was never started.
 \par
@@ -1324,140 +1582,22 @@ void ILibChain_SafeRemove_SubChain(void *chain, void *subChain)
 */
 void ILibChain_DestroyEx(void *subChain)
 {
-	struct ILibBaseChain* newChain = (struct ILibBaseChain*)subChain;
-	struct ILibBaseChain* temp;
+	ILibChain* module;
+	void* node;
 
 	if (subChain == NULL) return;
 
-	while (newChain != NULL && newChain->Object != NULL)
+	node = ILibLinkedList_GetNode_Head(((ILibBaseChain*)subChain)->Links);
+	while (node != NULL && (module = (ILibChain*)ILibLinkedList_GetDataFromNode(node)) != NULL)
 	{
-		if (((struct ILibChain*)newChain->Object)->Destroy != NULL)
-		{
-			((struct ILibChain*)newChain->Object)->Destroy(newChain->Object);
-			free(newChain->Object);
-		}
-		temp = newChain->Next;
-		free(newChain);
-		newChain = temp;
+		if (module->Destroy != NULL) { module->Destroy((void*)module); }
+		free(module);
+		node = ILibLinkedList_GetNextNode(node);
 	}
+	ILibLinkedList_Destroy(((ILibBaseChain*)subChain)->Links);
+	ILibLinkedList_Destroy(((ILibBaseChain*)subChain)->LinksPendingDelete);
+	free(subChain);
 }
-#if defined(__SYMBIAN32__)
-void ILibChain_OnPreSelect(void *sender)
-{
-	void *Chain = ILibChainAdaptor_GetChain(sender);
-	struct ILibBaseChain *c = (struct ILibBaseChain*)Chain;
-	struct timeval tv;
-	int slct;
-	int v;
-	void *temp;
-	void *SymbianAdaptor = NULL;
-	ILibOnChainStopped OnStopped = c->OnChainStoppedHandler;
-	void *user = c->OnChainStoppedUserObj;
-
-	ILibSocketWrapper_struct_FDSET readset;
-	ILibSocketWrapper_struct_FDSET errorset;
-	ILibSocketWrapper_struct_FDSET writeset;
-
-	ILibSocketWrapper_FDZERO(&readset);
-	ILibSocketWrapper_FDZERO(&errorset);
-	ILibSocketWrapper_FDZERO(&writeset);
-
-	slct = 0;
-
-	tv.tv_sec = UPNP_MAX_WAIT;
-	tv.tv_usec = 0;
-
-	//
-	// Iterate through all the PreSelect function pointers in the chain
-	//
-	c = (struct ILibBaseChain*)Chain;
-	while (c!=NULL && c->Object != NULL)
-	{
-		if (((struct ILibChain*)c->Object)->PreSelect!=NULL)
-		{
-			v = (tv.tv_sec * 1000) + (tv.tv_usec / 1000);
-			((struct ILibChain*)c->Object)->PreSelect(c->Object, &readset, &writeset, &errorset, &v);
-			tv.tv_sec = v / 1000;
-			tv.tv_usec = 1000 * (v % 1000);
-		}
-		c = c->Next;
-	}
-
-	if (((struct ILibBaseChain*)Chain)->TerminateFlag == 0)
-	{
-		ILibChainAdaptor_Select(sender, &readset, &writeset, &errorset, v);
-	}
-	else
-	{
-		//
-		// Quitting Time
-		//
-		SymbianAdaptor = ((struct ILibBaseChain*)Chain)->SymbianAdaptor;
-
-		//
-		// This loop will start, when the Chain was signaled to quit. Clean up the chain
-		// by iterating through all the Destroy.
-		//
-		c = (struct ILibBaseChain*)Chain;
-		while (c!=NULL && c->Object!=NULL)
-		{
-			if (((struct ILibChain*)c->Object)->Destroy!=NULL)
-			{
-				((struct ILibChain*)c->Object)->Destroy(c->Object);
-			}
-			//
-			// After calling the Destroy, we free the link
-			//
-			free(c->Object);
-			c = c->Next;
-		}
-		ILibSocketWrapper_Destroy();
-
-		//
-		// Now we actually free the chain
-		//
-		c = (struct ILibBaseChain*)Chain;
-		while (c!=NULL)
-		{
-			temp = c->Next;
-			free(c);
-			c = temp;
-		}
-		if (ILibChainLock_RefCounter==1)
-		{
-			sem_destroy(&ILibChainLock);
-		}
-		--ILibChainLock_RefCounter;
-
-		ILibChainAdaptor_StopChain(SymbianAdaptor);
-	}
-	if (OnStopped!=NULL)
-	{
-		OnStopped(user);
-	}
-}
-void ILibChain_OnPostSelect(void* sender, void *fds_read, void *fds_write, void *fds_error)
-{
-	void *Chain = ILibChainAdaptor_GetChain(sender);
-	struct ILibBaseChain *c = (struct ILibBaseChain*)Chain;
-
-	//
-	// Iterate through all of the PostSelect in the chain
-	//
-	c = (struct ILibBaseChain*)Chain;
-	while (c!=NULL && c->Object!=NULL)
-	{
-		if (((struct ILibChain*)c->Object)->PostSelect!=NULL)
-		{
-			((struct ILibChain*)c->Object)->PostSelect(c->Object,1,fds_read,fds_write,fds_error);
-		}
-		c = c->Next;
-	}	
-}
-void ILibChain_OnDestroy(void *sender)
-{
-}
-#endif
 /*! \fn ILibStartChain(void *Chain)
 \brief Starts a Chain
 \par
@@ -1468,44 +1608,29 @@ will not return until ILibStopChain is called.
 */
 void ILibStartChain(void *Chain)
 {
-	struct ILibBaseChain *c = (struct ILibBaseChain*)Chain;
-	struct ILibBaseChain *temp;
+	void* node;
+	ILibChain *module;
 
-#if defined(__SYMBIAN32__)
-	ILibSocketWrapper_struct_FDSET readset;
-	ILibSocketWrapper_struct_FDSET errorset;
-	ILibSocketWrapper_struct_FDSET writeset;
-	void *ChainAdaptor = ILibChainAdaptor_CreateChainAdaptor(Chain);
-#else
 	fd_set readset;
 	fd_set errorset;
 	fd_set writeset;
-#endif
 
 	struct timeval tv;
 	int slct;
 	int v;
 
 #if defined(WIN32)
-	c->ChainThreadID = GetCurrentThreadId();
+	((ILibBaseChain*)Chain)->ChainThreadID = GetCurrentThreadId();
 #else
-	c->ChainThreadID = pthread_self();
+	((ILibBaseChain*)Chain)->ChainThreadID = pthread_self();
 #endif
 
-#if !defined(__SYMBIAN32__)
 #if !defined(WIN32) && !defined(_WIN32_WCE)
 	int TerminatePipe[2];
 	int flags;
 #endif
-#endif
 
-#if defined(__SYMBIAN32__)
-	c->SymbianAdaptor = ChainAdaptor;
-	ILibChainAdaptor_StartChain(ChainAdaptor, &ILibChain_OnPreSelect, &ILibChain_OnPostSelect, &ILibChain_OnDestroy);
-	//ToDo: The fact that we are returning, and not blocking may cause problems, so we
-	//		need to investigate this further. 
-	return;
-#endif
+	if (gILibChain == NULL) {gILibChain = Chain;} // Set the global instance if it's not already set
 
 	//
 	// Use this thread as if it's our own. Keep looping until we are signaled to stop
@@ -1514,7 +1639,6 @@ void ILibStartChain(void *Chain)
 	FD_ZERO(&errorset);
 	FD_ZERO(&writeset);
 
-#if !defined(__SYMBIAN32__)
 #if !defined(WIN32) && !defined(_WIN32_WCE)
 	// 
 	// For posix, we need to use a pipe to force unblock the select loop
@@ -1527,7 +1651,6 @@ void ILibStartChain(void *Chain)
 	fcntl(TerminatePipe[0],F_SETFL,O_NONBLOCK|flags);
 	((struct ILibBaseChain*)Chain)->TerminateReadPipe = fdopen(TerminatePipe[0],"r");
 	((struct ILibBaseChain*)Chain)->TerminateWritePipe = fdopen(TerminatePipe[1],"w");
-#endif
 #endif
 
 	((struct ILibBaseChain*)Chain)->RunningFlag = 1;
@@ -1543,25 +1666,25 @@ void ILibStartChain(void *Chain)
 		//
 		// Iterate through all the PreSelect function pointers in the chain
 		//
-		c = (struct ILibBaseChain*)Chain;
+		node = ILibLinkedList_GetNode_Head(((ILibBaseChain*)Chain)->Links);
 		v = (tv.tv_sec * 1000) + (tv.tv_usec / 1000);
-		while (c != NULL && c->Object != NULL)
+		while(node!=NULL && (module=(ILibChain*)ILibLinkedList_GetDataFromNode(node))!=NULL)
 		{
-			if (((struct ILibChain*)c->Object)->PreSelect != NULL)
+			if(module->PreSelect != NULL)
 			{
 #ifdef MEMORY_CHECK
 #ifdef WIN32
 				//_CrtCheckMemory();
 #endif
 #endif
-				((struct ILibChain*)c->Object)->PreSelect(c->Object, &readset, &writeset, &errorset, &v);
+				module->PreSelect((void*)module, &readset, &writeset, &errorset, &v);
 #ifdef MEMORY_CHECK
 #ifdef WIN32
 				//_CrtCheckMemory();
 #endif
 #endif
 			}
-			c = (struct ILibBaseChain*)c->Next;
+			node = ILibLinkedList_GetNextNode(node);
 		}
 		tv.tv_sec =  v / 1000;
 		tv.tv_usec = 1000 * (v % 1000);
@@ -1582,20 +1705,28 @@ void ILibStartChain(void *Chain)
 			FD_SET(((struct ILibBaseChain*)Chain)->Terminate, &errorset);
 #pragma warning( pop )
 		}
-#elif !defined(__SYMBIAN32__)
+#else
 		//
 		// Put the Read end of the Pipe in the FDSET, for ILibForceUnBlockChain
 		//
 		FD_SET(TerminatePipe[0], &readset);
 #endif
+		while(ILibLinkedList_GetCount(((ILibBaseChain*)Chain)->LinksPendingDelete) > 0)
+		{
+			node = ILibLinkedList_GetNode_Head(((ILibBaseChain*)Chain)->LinksPendingDelete);
+			module = (ILibChain*)ILibLinkedList_GetDataFromNode(node);
+			ILibLinkedList_Remove_ByData(((ILibBaseChain*)Chain)->Links, module);
+			ILibLinkedList_Remove(node);
+			if(module->Destroy != NULL) {module->Destroy((void*)module);}
+			free(module);
+		}
+
 		sem_post(&ILibChainLock);
 
 		//
 		// The actual Select Statement
 		//
-#if !defined(__SYMBIAN32__)
 		slct = select(FD_SETSIZE, &readset, &writeset, &errorset, &tv);
-#endif
 		if (slct == -1)
 		{
 			//
@@ -1614,7 +1745,7 @@ void ILibStartChain(void *Chain)
 		{
 			((struct ILibBaseChain*)Chain)->Terminate = socket(AF_INET, SOCK_DGRAM, 0);
 		}
-#elif !defined(__SYMBIAN32__)
+#else
 		if (FD_ISSET(TerminatePipe[0], &readset))
 		{
 			//
@@ -1628,24 +1759,24 @@ void ILibStartChain(void *Chain)
 		//
 		// Iterate through all of the PostSelect in the chain
 		//
-		c = (struct ILibBaseChain*)Chain;
-		while (c != NULL && c->Object != NULL)
+		node = ILibLinkedList_GetNode_Head(((ILibBaseChain*)Chain)->Links);
+		while(node!=NULL && (module=(ILibChain*)ILibLinkedList_GetDataFromNode(node))!=NULL)
 		{
-			if (((struct ILibChain*)c->Object)->PostSelect != NULL)
+			if (module->PostSelect != NULL)
 			{
 #ifdef MEMORY_CHECK
 #ifdef WIN32
 				//_CrtCheckMemory();
 #endif
 #endif
-				((struct ILibChain*)c->Object)->PostSelect(c->Object, slct, &readset, &writeset, &errorset);
+				module->PostSelect((void*)module, slct, &readset, &writeset, &errorset);
 #ifdef MEMORY_CHECK
 #ifdef WIN32
 				//_CrtCheckMemory();
 #endif
 #endif
 			}
-			c = (struct ILibBaseChain*)c->Next;
+			node = ILibLinkedList_GetNextNode(node);
 		}
 	}
 
@@ -1660,63 +1791,76 @@ void ILibStartChain(void *Chain)
 	// be destroyed first since it's at the start of the chain. This will allow modules to clean
 	// up nicely.
 	//
-	c = (struct ILibBaseChain*)Chain;
-	c = (struct ILibBaseChain*)c->Next; // Skip the base timer which is the first element in the chain.
+	node = ILibLinkedList_GetNode_Head(((ILibBaseChain*)Chain)->Links);
+	if(node != NULL) {node = ILibLinkedList_GetNextNode(node);} // Skip the base timer which is the first element in the chain.
 
 	//
 	// Set the Terminate Flag to 1, so that ILibIsChainBeingDestroyed returns non-zero when we start cleanup
 	//
 	((struct ILibBaseChain*)Chain)->TerminateFlag = 1;
 
-	while (c != NULL && c->Object != NULL)
+	while(node!=NULL && (module=(ILibChain*)ILibLinkedList_GetDataFromNode(node))!=NULL)
 	{
 		//
 		// If this module has a destroy method, call it.
 		//
-		if (((struct ILibChain*)c->Object)->Destroy != NULL) ((struct ILibChain*)c->Object)->Destroy(c->Object);
+		if (module->Destroy != NULL) module->Destroy((void*)module);
 		//
-		// After calling the Destroy, we free the module and mode to the next
+		// After calling the Destroy, we free the module and move to the next
 		//
-		free(c->Object);
-		c = (struct ILibBaseChain*)c->Next;
+		free(module);
+		node = ILibLinkedList_Remove(node);
 	}
+
+	if (gILibChain ==  Chain) { gILibChain = NULL; } // Reset the global instance if it was set
 
 	//
 	// Go back and destroy the base timer for this chain, the first element in the chain.
 	//
-	c = (struct ILibBaseChain*)Chain;
-	if (c->Timer != NULL)
+	node = ILibLinkedList_GetNode_Head(((ILibBaseChain*)Chain)->Links);
+	if (node!=NULL && (module=(ILibChain*)ILibLinkedList_GetDataFromNode(node))!=NULL)
 	{
-		((struct ILibChain*)c->Timer)->Destroy(c->Object);
-		free(c->Timer);
+		module->Destroy((void*)module);
+		free(module);
+		((ILibBaseChain*)Chain)->Timer = NULL;
 	}
+
+	ILibLinkedList_Destroy(((ILibBaseChain*)Chain)->Links);
+
+	node = ILibLinkedList_GetNode_Head(((ILibBaseChain*)Chain)->LinksPendingDelete);
+	while(node != NULL && (module = (ILibChain*)ILibLinkedList_GetDataFromNode(node)) != NULL)
+	{
+		if(module->Destroy != NULL) {module->Destroy((void*)module);}
+		free(module);
+		node = ILibLinkedList_GetNextNode(node);
+	}
+	ILibLinkedList_Destroy(((ILibBaseChain*)Chain)->LinksPendingDelete);
+
+#ifdef _REMOTELOGGINGSERVER
+	if (((ILibBaseChain*)Chain)->LoggingWebServer != NULL && ((ILibBaseChain*)Chain)->ChainLogger != NULL) { ILibRemoteLogging_Destroy(((ILibBaseChain*)Chain)->ChainLogger); }
+#endif
+	if(((struct ILibBaseChain*)Chain)->ChainStash != NULL) {ILibHashtable_Destroy(((struct ILibBaseChain*)Chain)->ChainStash);}
 
 	//
 	// Now we actually free the chain, before we just freed what the chain pointed to.
 	//
-	c = (struct ILibBaseChain*)Chain;
 #if !defined(WIN32) && !defined(_WIN32_WCE)
 	//
 	// Free the pipe resources
 	//
-	fclose(c->TerminateReadPipe);
-	fclose(c->TerminateWritePipe);
-	c->TerminateReadPipe=0;
-	c->TerminateWritePipe=0;
+	fclose(((ILibBaseChain*)Chain)->TerminateReadPipe);
+	fclose(((ILibBaseChain*)Chain)->TerminateWritePipe);
+	((ILibBaseChain*)Chain)->TerminateReadPipe=0;
+	((ILibBaseChain*)Chain)->TerminateWritePipe=0;
 #endif
 #if defined(WIN32)
-	if (c->Terminate != ~0)
+	if (((ILibBaseChain*)Chain)->Terminate != ~0)
 	{
-		closesocket(c->Terminate);
-		c->Terminate = (SOCKET)~0;
+		closesocket(((ILibBaseChain*)Chain)->Terminate);
+		((ILibBaseChain*)Chain)->Terminate = (SOCKET)~0;
 	}
 #endif
-	while (c != NULL)
-	{
-		temp = (struct ILibBaseChain*)c->Next;
-		free(c);
-		c = temp;
-	}
+
 #ifdef WIN32
 	WSACleanup();
 #endif
@@ -1725,6 +1869,7 @@ void ILibStartChain(void *Chain)
 		sem_destroy(&ILibChainLock);
 	}
 	--ILibChainLock_RefCounter;
+	free(Chain);
 }
 
 /*! \fn ILibStopChain(void *Chain)
@@ -1739,13 +1884,6 @@ void ILibStopChain(void *Chain)
 	((struct ILibBaseChain*)Chain)->TerminateFlag = 2;
 	ILibForceUnBlockChain(Chain);
 }
-#if defined(__SYMBIAN32__)
-void ILibChain_SetOnStoppedHandler(void *chain, void *user, ILibOnChainStopped Handler)
-{
-	((struct ILibBaseChain*)chain)->OnChainStoppedHandler = Handler;
-	((struct ILibBaseChain*)chain)->OnChainStoppedUserObj = user;
-}
-#endif
 
 /*! \fn ILibDestructXMLNodeList(struct ILibXMLNode *node)
 \brief Frees resources from an XMLNodeList tree that was returned from ILibParseXML
@@ -2355,7 +2493,7 @@ struct ILibXMLNode *ILibParseXML(char *buffer, int offset, int length)
 				//
 				NSTag = temp3->FirstResult->data;
 				NSTagLength = temp3->FirstResult->datalength;
-				TagName = temp3->FirstResult->NextResult->data;
+				TagName = temp3->FirstResult->NextResult->data; // Note: Klocwork reports that this may be NULL, but that is not possible, becuase NumResults is > 1 in this block
 				TagNameLength = temp3->FirstResult->NextResult->datalength;
 			}
 			ILibDestructParserResults(temp3);
@@ -2455,36 +2593,36 @@ struct ILibXMLNode *ILibParseXML(char *buffer, int offset, int length)
 \brief Create an empty Queue
 \returns An empty queue
 */
-void *ILibQueue_Create()
+ILibQueue ILibQueue_Create()
 {
-	return(ILibLinkedList_Create());
+	return((ILibQueue)ILibLinkedList_Create());
 }
 
 /*! \fn ILibQueue_Lock(void *q)
 \brief Locks a queue
 \param q The queue to lock
 */
-void ILibQueue_Lock(void *q)
+void ILibQueue_Lock(ILibQueue q)
 {
-	ILibLinkedList_Lock(q);
+	ILibLinkedList_Lock((ILibLinkedList)q);
 }
 
 /*! \fn ILibQueue_UnLock(void *q)
 \brief Unlocks a queue
 \param q The queue to unlock
 */
-void ILibQueue_UnLock(void *q)
+void ILibQueue_UnLock(ILibQueue q)
 {
-	ILibLinkedList_UnLock(q);
+	ILibLinkedList_UnLock((ILibLinkedList)q);
 }
 
 /*! \fn ILibQueue_Destroy(void *q)
 \brief Frees the resources associated with a queue
 \param q The queue to free
 */
-void ILibQueue_Destroy(void *q)
+void ILibQueue_Destroy(ILibQueue q)
 {
-	ILibLinkedList_Destroy(q);
+	ILibLinkedList_Destroy((ILibLinkedList)q);
 }
 
 /*! \fn ILibQueue_IsEmpty(void *q)
@@ -2492,9 +2630,9 @@ void ILibQueue_Destroy(void *q)
 \param q The queue to check
 \returns zero value if not empty, non-zero if empty
 */
-int ILibQueue_IsEmpty(void *q)
+int ILibQueue_IsEmpty(ILibQueue q)
 {
-	return(ILibLinkedList_GetNode_Head(q)==NULL?1:0);
+	return(ILibLinkedList_GetNode_Head((ILibLinkedList)q)==NULL?1:0);
 }
 
 /*! \fn ILibQueue_EnQueue(void *q, void *data)
@@ -2502,21 +2640,21 @@ int ILibQueue_IsEmpty(void *q)
 \param q The queue to add to
 \param data The data to add to the queue
 */
-void ILibQueue_EnQueue(void *q, void *data)
+void ILibQueue_EnQueue(ILibQueue q, void *data)
 {
-	ILibLinkedList_AddTail(q,data);
+	ILibLinkedList_AddTail((ILibLinkedList)q,data);
 }
 /*! \fn ILibQueue_DeQueue(void *q)
 \brief Removes an item from the queue
 \param q The queue to pop the item from
 \returns The item popped off the queue. NULL if empty
 */
-void *ILibQueue_DeQueue(void *q)
+void *ILibQueue_DeQueue(ILibQueue q)
 {
 	void *RetVal = NULL;
 	void *node;
 
-	node = ILibLinkedList_GetNode_Head(q);
+	node = ILibLinkedList_GetNode_Head((ILibLinkedList)q);
 	if (node!=NULL)
 	{
 		RetVal = ILibLinkedList_GetDataFromNode(node);
@@ -2530,12 +2668,12 @@ void *ILibQueue_DeQueue(void *q)
 \param q The queue to peek an item from
 \returns The item from the queue. NULL if empty
 */
-void *ILibQueue_PeekQueue(void *q)
+void *ILibQueue_PeekQueue(ILibQueue q)
 {
 	void *RetVal = NULL;
 	void *node;
 
-	node = ILibLinkedList_GetNode_Head(q);
+	node = ILibLinkedList_GetNode_Head((ILibLinkedList)q);
 	if (node!=NULL)
 	{
 		RetVal = ILibLinkedList_GetDataFromNode(node);
@@ -2548,9 +2686,9 @@ void *ILibQueue_PeekQueue(void *q)
 \param q The queue to query
 \returns The item count in the queue.
 */
-long ILibQueue_GetCount(void *q)
+long ILibQueue_GetCount(ILibQueue q)
 {
-	return ILibLinkedList_GetCount(q);
+	return ILibLinkedList_GetCount((ILibLinkedList)q);
 }
 
 /*! \fn ILibCreateStack(void **TheStack)
@@ -3360,25 +3498,9 @@ struct parser_result* ILibParseStringAdv (char* buffer, int offset, int length, 
 */
 int ILibTrimString(char **theString, int length)
 {
-	int i;
-	int flag1=0,flag2=0;
-	for(i=0;i<length;++i)
-	{
-		if (!flag2 && (*theString)[length-i-1]!=8 && (*theString)[length-i-1]!=32)
-		{
-			length -= i;
-			flag2=1;
-			if (flag1 && flag2) {break;}
-		}		
-		if (!flag1 && (*theString)[i]!=8 && (*theString)[i]!=32)
-		{
-			*theString = *theString + i;
-			length -= i;
-			flag1=1;
-			if (flag1 && flag2) {break;}
-		}
-	}
-	return(length);
+	while (length > 0 && ((*theString)[0] == 9 || (*theString)[0] == 32)) { length--; (*theString)++; }					// Remove any blank chars at the start
+	while (length > 0 && ((*theString)[length - 1] == 9 || (*theString)[length - 1] == 32)) { length--; }				// Remove any blank chars at the end
+	return length;
 }
 
 /*! \fn ILibParseString(char* buffer, int offset, int length, char* Delimiter, int DelimiterLength)
@@ -3393,7 +3515,7 @@ quotation marks, whereas \a ILibParseStringAdv does.
 \param DelimiterLength The length of the delimiter
 \returns A list of tokens
 */
-struct parser_result* ILibParseString (char* buffer, int offset, int length, const char* Delimiter, int DelimiterLength)
+struct parser_result* ILibParseString(char* buffer, int offset, int length, const char* Delimiter, int DelimiterLength)
 {
 	int i = 0;
 	char* Token = NULL;
@@ -3414,7 +3536,7 @@ struct parser_result* ILibParseString (char* buffer, int offset, int length, con
 	Token = buffer + offset;
 	for(i = offset; i < length; ++i)
 	{
-		if (ILibIsDelimiter(buffer,i,length,Delimiter,DelimiterLength))
+		if (ILibIsDelimiter(buffer, i, length, Delimiter, DelimiterLength))
 		{
 			//
 			// We found a delimiter in the string
@@ -3715,7 +3837,7 @@ struct packetheader* ILibParsePacketHeader(char* buffer, int offset, int length)
 	//
 	StartLine = (struct parser_result*)ILibParseString(f->data, 0, f->datalength, " ", 1);
 	HeaderLine = f->NextResult;
-	if (memcmp(StartLine->FirstResult->data, "HTTP/", 5) == 0)
+	if (memcmp(StartLine->FirstResult->data, "HTTP/", 5) == 0 && StartLine->FirstResult->NextResult != NULL)
 	{
 		//
 		// If the StartLine starts with HTTP/, then we know this is a response packet.
@@ -3872,7 +3994,7 @@ struct packetheader* ILibParsePacketHeader(char* buffer, int offset, int length)
 				//
 				// There are already headers, so link this in the tail
 				//
-				RetVal->LastField->NextField = node;
+				RetVal->LastField->NextField = node; // Note: Klocwork says LastField could be NULL/dereferenced, but LastField is never going to be NULL.
 			}
 			RetVal->LastField = node;
 			ILibAddEntryEx(RetVal->HeaderTable,node->Field,node->FieldLength,node->FieldData,node->FieldDataLength);
@@ -4409,6 +4531,22 @@ void ILibAddHeaderLine(struct packetheader *packet, const char* FieldName, int F
 	}
 }
 
+char* ILibUrl_GetHost(char *url, int urlLen)
+{
+	int startX, endX;
+	char *retVal = NULL;
+	urlLen = urlLen >= 0 ? urlLen : strlen(url);
+
+	startX = ILibString_IndexOf(url, urlLen, "://", 3);
+	if (startX < 0) { startX = 0; } else { startX += 3; }
+
+	endX = ILibString_IndexOf(url + startX, urlLen - startX, "/", 1);
+	retVal = url + startX;
+	retVal[endX > 0 ? endX : urlLen - startX] = 0;
+
+	return(retVal);
+}
+
 /*! \fn ILibGetHeaderLine(struct packetheader *packet, char* FieldName, int FieldNameLength)
 \brief Retrieves an HTTP header value from a packet structure
 \par
@@ -4805,7 +4943,7 @@ void ILibLifeTime_AddEx(void *LifetimeMonitorObject,void *data, int ms, ILibLife
 //
 // An internal method used by the ILibLifeTime methods
 // 
-void ILibLifeTime_Check(void *LifeTimeMonitorObject, void *readset, void *writeset, void *errorset, int* blocktime)
+void ILibLifeTime_Check(void *LifeTimeMonitorObject, fd_set *readset, fd_set *writeset, fd_set *errorset, int* blocktime)
 {
 	void *node;
 	int removed;
@@ -5046,6 +5184,71 @@ int ILibFindEntryInTable(char *Entry, char **Table)
 	return(-1);
 }
 
+void ILibLinkedList_SetData(void *LinkedList_Node, void *data)
+{
+	((struct ILibLinkedListNode*)LinkedList_Node)->Data = data;
+}
+
+void ILibLinkedList_SortedInsertEx(void* LinkedList, ILibLinkedList_Comparer comparer, ILibLinkedList_Chooser chooser, void *data, void *user)
+{
+	void* node = ILibLinkedList_GetNode_Head(LinkedList);
+	if(node == NULL)
+	{
+		ILibLinkedList_AddHead(LinkedList, chooser(NULL, data, user));
+	}
+	else
+	{
+		while(node != NULL)
+		{
+			if(comparer(ILibLinkedList_GetDataFromNode(node), data) == 0)
+			{
+				// Duplicate. Replace entry				
+				ILibLinkedList_SetData(node, chooser(ILibLinkedList_GetDataFromNode(node), data, user));
+				break;
+			}
+			else if(comparer(ILibLinkedList_GetDataFromNode(node), data) < 0)
+			{
+				ILibLinkedList_InsertBefore(node, chooser(NULL, data, user));
+				break;
+			}
+			node = ILibLinkedList_GetNextNode(node);
+		}
+		if(node == NULL)
+		{
+			ILibLinkedList_AddTail(LinkedList, chooser(NULL, data, user));			
+		}
+	}
+}
+
+void* ILibLinkedList_SortedInsert_DefaultChooser(void *oldObject, void *newObject, void *user)
+{
+	*((void**)user) = oldObject;
+	return(newObject);
+}
+
+// If there is a duplicate (comparer returns 0), this method will replace the old data with new data, and return the old data
+void* ILibLinkedList_SortedInsert(void* LinkedList, ILibLinkedList_Comparer comparer, void *data)
+{
+	void *retVal = NULL;
+	ILibLinkedList_SortedInsertEx(LinkedList, comparer, &ILibLinkedList_SortedInsert_DefaultChooser, data, &retVal);
+	return(retVal);
+}
+void* ILibLinkedList_GetNode_Search(void* LinkedList, ILibLinkedList_Comparer comparer, void *matchWith)
+{
+	void *retVal = NULL;
+	void *node = ILibLinkedList_GetNode_Head(LinkedList);
+	while(node != NULL)
+	{
+		if((comparer!=NULL && comparer(ILibLinkedList_GetDataFromNode(node), matchWith)==0) || (comparer == NULL && ILibLinkedList_GetDataFromNode(node) == matchWith))
+		{
+			retVal = node;
+			break;
+		}
+		node = ILibLinkedList_GetNextNode(node);
+	}
+	return(retVal);
+}
+
 /*! \fn ILibLinkedList_Create()
 \brief Create an empty Linked List Data Structure
 \returns Empty Linked List
@@ -5054,11 +5257,18 @@ void* ILibLinkedList_Create()
 {
 	struct ILibLinkedListNode_Root *root;
 	if ((root = (struct ILibLinkedListNode_Root*)malloc(sizeof(struct ILibLinkedListNode_Root))) == NULL) ILIBCRITICALEXIT(254);
-	root->Head = NULL;
-	root->Tail = NULL;
-	root->count = 0;
+	memset(root, 0, sizeof(struct ILibLinkedListNode_Root));
 	sem_init(&(root->LOCK), 0, 1);
 	return root;
+}
+
+void ILibLinkedList_SetTag(ILibLinkedList list, void *tag)
+{
+	((struct ILibLinkedListNode_Root*)list)->Tag = tag;
+}
+void* ILibLinkedList_GetTag(ILibLinkedList list)
+{
+	return(((struct ILibLinkedListNode_Root*)list)->Tag);
 }
 
 /*! \fn ILibLinkedList_ShallowCopy(void *LinkedList)
@@ -5198,10 +5408,15 @@ void ILibLinkedList_InsertBefore(void *LinkedList_Node, void *data)
 */
 void* ILibLinkedList_Remove(void *LinkedList_Node)
 {
-	struct ILibLinkedListNode_Root *r = ((struct ILibLinkedListNode*)LinkedList_Node)->Root;
-	struct ILibLinkedListNode *n = (struct ILibLinkedListNode*) LinkedList_Node;
+	struct ILibLinkedListNode_Root *r;
+	struct ILibLinkedListNode *n;
+	void* RetVal;
 
-	void* RetVal = n->Next;
+	if (LinkedList_Node == NULL) { return(NULL); }
+
+	r = ((struct ILibLinkedListNode*)LinkedList_Node)->Root;
+	n = (struct ILibLinkedListNode*) LinkedList_Node;
+	RetVal = n->Next;
 
 	if (n->Previous!=NULL)
 	{
@@ -5351,6 +5566,416 @@ long ILibLinkedList_GetCount(void *LinkedList)
 	return(((struct ILibLinkedListNode_Root*)LinkedList)->count);
 }
 
+int ILibHashtable_DefaultBucketizer(int value)
+{
+	// Convert 4 bytes to 1 byte
+	unsigned char tmp[4];
+	int retVal = 0;
+
+	((unsigned int*)tmp)[0] = value;
+	retVal = (int)(tmp[0] ^ tmp[1] ^ tmp[2] ^ tmp[3]); //Klocwork is being retarded, and doesn't realize an unsigned int is 4 bytes
+
+	return(retVal);
+}
+int ILibHashtable_DefaultHashFunc(void* Key1, char* Key2, int Key2Len)
+{
+	char tmp[4];
+	int i;
+	int retVal = 0;
+	union{int i; void* p;}u;
+
+	u.p = Key1;
+	if(Key1!=NULL) {retVal ^= u.i;}
+	if(Key2 != NULL && Key2Len < 5) 
+	{
+		((int*)tmp)[0] = 0;
+		for(i=0;i<Key2Len;++i)
+		{
+			tmp[i] = Key2[i];
+		}
+		retVal ^= ((int*)tmp)[0];
+	}
+	if(Key2 != NULL && Key2Len < 9)
+	{
+		((int*)tmp)[0] = 0;
+		for(i=0;i<4;++i)
+		{
+			tmp[i] = Key2[Key2Len-1-i];
+		}
+		retVal ^= ((int*)tmp)[0];
+	}
+	if(Key2 != NULL && Key2Len > 12)
+	{
+		int x = Key2Len / 2;
+		((int*)tmp)[0] = 0;
+		for(i=0;i<4;++i)
+		{
+			tmp[i] = Key2[i+x];
+		}
+		retVal ^= ((int*)tmp)[0];
+	}
+
+	return(retVal & 0x7FFFFFFF);
+}
+ILibHashtable ILibHashtable_Create()
+{
+	ILibHashtable_Root *retVal;
+	
+	if((retVal = (ILibHashtable_Root*)malloc(sizeof(ILibHashtable_Root))) == NULL) {ILIBCRITICALEXIT(254);}
+	memset(retVal, 0, sizeof(ILibHashtable_Root));
+	
+	ILibHashtable_ChangeHashFunc(retVal, &ILibHashtable_DefaultHashFunc);
+	ILibHashtable_ChangeBucketizer(retVal, 256, &ILibHashtable_DefaultBucketizer);
+	
+	return(retVal);
+}
+void ILibHashtable_DestroyEx2(ILibSparseArray sender, int index, void *value, void *user)
+{
+	UNREFERENCED_PARAMETER(sender);
+	UNREFERENCED_PARAMETER(index);
+
+	if(value != NULL)
+	{
+		ILibHashtable_Node *tmp, *node = (ILibHashtable_Node*)value;
+		ILibHashtable_OnDestroy onDestroy = (ILibHashtable_OnDestroy)((void**)user)[1];
+		while(node != NULL)
+		{
+			if(onDestroy!=NULL) {onDestroy(((void**)user)[0], node->Key1, node->Key2, node->Key2Len, node->Data, ((void**)user)[2]);}
+			tmp = node->next;
+			if(node->Key2 != NULL) { free(node->Key2); }
+			free(node);
+			node = tmp;
+		}
+	}
+}
+void ILibHashtable_DestroyEx(ILibHashtable table, ILibHashtable_OnDestroy onDestroy, void *user)
+{
+	ILibHashtable_Root *root = (ILibHashtable_Root*)table;
+	void* temp[3];
+
+	temp[0] = table;
+	temp[1] = onDestroy;
+	temp[2] = user;
+	ILibSparseArray_DestroyEx(root->table, &ILibHashtable_DestroyEx2, temp);
+	free(root);
+}
+
+void ILibHashtable_ChangeHashFunc(ILibHashtable table, ILibHashtable_Hash_Func hashFunc)
+{
+	((ILibHashtable_Root*)table)->hashFunc = hashFunc;
+}
+void ILibHashtable_ChangeBucketizer(ILibHashtable table, int bucketCount, ILibSparseArray_Bucketizer bucketizer)
+{
+	if(((ILibHashtable_Root*)table)->table != NULL) {ILibSparseArray_Destroy(((ILibHashtable_Root*)table)->table);}
+	((ILibHashtable_Root*)table)->table = ILibSparseArray_Create(bucketCount, bucketizer);
+}
+ILibHashtable_Node* ILibHashtable_CreateNode(void* Key1, char* Key2, int Key2Len, void* Data)
+{
+	ILibHashtable_Node *node;
+
+	if((node = (ILibHashtable_Node*)malloc(sizeof(ILibHashtable_Node))) == NULL) {ILIBCRITICALEXIT(254);}
+	memset(node, 0, sizeof(ILibHashtable_Node));
+	node->Data = Data;
+	node->Key1 = Key1;
+	node->Key2Len = Key2Len;
+	if(Key2Len > 0)
+	{
+		if((node->Key2 = (char*)malloc(Key2Len))==NULL) {ILIBCRITICALEXIT(254);}
+		memcpy(node->Key2, Key2, Key2Len);
+	}
+	return(node);
+}
+
+ILibHashtable_Node* ILibHashtable_GetEx(ILibHashtable table, void *Key1, char* Key2, int Key2Len, ILibHashtable_Flags flags)
+{
+	ILibHashtable_Node *retVal = NULL;
+	ILibHashtable_Root* root = (ILibHashtable_Root*)table;
+	int hash = root->hashFunc(Key1, Key2, Key2Len);
+	ILibHashtable_Node *node = (ILibHashtable_Node*)ILibSparseArray_Get(root->table, hash);
+
+	if(node == NULL)
+	{
+		// Entry doesn't exist, so create a new entry
+		if((flags & ILibHashtable_Flags_ADD) == ILibHashtable_Flags_ADD) 
+		{
+			retVal = ILibHashtable_CreateNode(Key1, Key2, Key2Len, NULL);
+			ILibSparseArray_Add(root->table, hash, retVal);
+		}
+	}
+	else
+	{
+		// There is a hash entry, so lets enumerate to see if we really have a match
+		ILibHashtable_Node *prev = NULL;
+		while(node!=NULL)
+		{
+			if(node->Key1 == Key1 && node->Key2Len == Key2Len && memcmp(node->Key2, Key2, Key2Len)==0)
+			{
+				break;
+			}
+			prev = node;
+			node = node->next;
+		}
+		if(node == NULL)
+		{
+			// There were no matches in the hashes that were returned
+
+			if((flags & ILibHashtable_Flags_ADD) == ILibHashtable_Flags_ADD) 
+			{
+				// Create a new entry, and append ourself to the hash results
+				retVal = ILibHashtable_CreateNode(Key1, Key2, Key2Len, NULL);
+				prev->next = retVal;
+				retVal->prev = prev;
+			}
+		}
+		else
+		{
+			// There was a match! Update the value and return the old value
+			retVal = node;
+			if((flags & ILibHashtable_Flags_REMOVE) == ILibHashtable_Flags_REMOVE) 
+			{
+				if(node->prev == NULL)
+				{
+					// This is the first entry, so we'll have to remove the entry from the SparseArray
+					ILibSparseArray_Remove(root->table, hash);
+				}
+				else
+				{
+					node->prev->next = node->next;
+					if(node->next != NULL) {node->next->prev = node->prev;}
+				}
+			}			
+		}
+	}
+	return(retVal);
+}
+void* ILibHashtable_Put(ILibHashtable table, void *Key1, char* Key2, int Key2Len, void* Data)
+{	
+	ILibHashtable_Node *node = ILibHashtable_GetEx(table, Key1, Key2, Key2Len, ILibHashtable_Flags_ADD);
+	void *retVal = node->Data;
+	node->Data = Data;
+	return(retVal);
+}
+void* ILibHashtable_Get(ILibHashtable table, void *Key1, char* Key2, int Key2Len)
+{
+	ILibHashtable_Node *node = ILibHashtable_GetEx(table, Key1, Key2, Key2Len, ILibHashtable_Flags_NONE);
+	return(node != NULL ? node->Data : NULL);
+}
+void* ILibHashtable_Remove(ILibHashtable table, void *Key1, char* Key2, int Key2Len)
+{
+	ILibHashtable_Node *node = ILibHashtable_GetEx(table, Key1, Key2, Key2Len, ILibHashtable_Flags_REMOVE);
+	void *retVal = node != NULL ? node->Data : NULL;
+	if(node != NULL)
+	{
+		if(node->Key2 != NULL) {free(node->Key2);}
+		free(node);
+	}
+	return(retVal);
+}
+void ILibHashtable_Lock(ILibHashtable table)
+{
+	ILibSparseArray_Lock(((ILibHashtable_Root*)table)->table);
+}
+void ILibHashtable_UnLock(ILibHashtable table)
+{
+	ILibSparseArray_UnLock(((ILibHashtable_Root*)table)->table);
+}
+
+
+ILibSparseArray ILibSparseArray_Create(int numberOfBuckets, ILibSparseArray_Bucketizer bucketizer)
+{
+	ILibSparseArray_Root *retVal = (ILibSparseArray_Root*)malloc(sizeof(ILibSparseArray_Root));
+	sem_init(&(retVal->LOCK), 0, 1);
+	retVal->bucketSize = numberOfBuckets;
+	retVal->bucketizer = bucketizer;
+	retVal->bucket = (ILibSparseArray_Node*)malloc(numberOfBuckets * sizeof(ILibSparseArray_Node));
+	memset(retVal->bucket, 0, numberOfBuckets * sizeof(ILibSparseArray_Node));
+
+	return(retVal);
+}
+ILibSparseArray ILibSparseArray_CreateEx(ILibSparseArray source)
+{
+	return(ILibSparseArray_Create(((ILibSparseArray_Root*)source)->bucketSize, ((ILibSparseArray_Root*)source)->bucketizer));
+}
+
+
+int ILibSparseArray_Comparer(void *obj1, void *obj2)
+{
+	if(((ILibSparseArray_Node*)obj1)->index == ((ILibSparseArray_Node*)obj2)->index)
+	{
+		return(0);
+	}
+	else
+	{
+		return(((ILibSparseArray_Node*)obj1)->index < ((ILibSparseArray_Node*)obj2)->index ? -1 : 1);
+	}
+}
+void* ILibSparseArray_Add(ILibSparseArray sarray, int index, void *data)
+{
+	void* retVal = NULL;
+	ILibSparseArray_Root *root = (ILibSparseArray_Root*)sarray;
+	int i = root->bucketizer(index);
+
+	if(root->bucket[i].index == 0 && root->bucket[i].ptr == NULL)
+	{
+		// No Entry Exists
+		root->bucket[i].index = index;
+		root->bucket[i].ptr = data;
+	}
+	else if(root->bucket[i].index < 0)
+	{
+		// Need to use Linked List
+		ILibSparseArray_Node* n = (ILibSparseArray_Node*)malloc(sizeof(ILibSparseArray_Node));
+		n->index = index;
+		n->ptr = data;
+		n = (ILibSparseArray_Node*)ILibLinkedList_SortedInsert(root->bucket[i].ptr, &ILibSparseArray_Comparer, n);
+		if(n!=NULL)
+		{
+			// This duplicates an entry already in the list... Updated with new value, pass back the old
+			retVal = n->ptr;
+			free(n);
+		}
+	}
+	else 
+	{
+		// No Linked List... We either need to create one, or check to see if this is possibly a duplicate entry
+		if(root->bucket[i].index == index)
+		{
+			// Today's our lucky day! We can just replace the value! (No return value)
+			retVal = root->bucket[i].ptr;
+			root->bucket[i].ptr = data;
+		}
+		else
+		{
+			// We need to create a linked list, add the old value, then insert our new value (No return value)
+			ILibSparseArray_Node* n = (ILibSparseArray_Node*)malloc(sizeof(ILibSparseArray_Node));
+			n->index = root->bucket[i].index;
+			n->ptr = root->bucket[i].ptr;
+
+			root->bucket[i].index = -1;
+			root->bucket[i].ptr = ILibLinkedList_Create();
+			ILibLinkedList_AddHead(root->bucket[i].ptr, n);
+
+			n = (ILibSparseArray_Node*)malloc(sizeof(ILibSparseArray_Node));
+			n->index = index;
+			n->ptr = data;
+			ILibLinkedList_SortedInsert(root->bucket[i].ptr, &ILibSparseArray_Comparer, n);
+		}
+	}
+	return(retVal);
+}
+
+void* ILibSparseArray_GetEx(ILibSparseArray sarray, int index, int remove)
+{
+	ILibSparseArray_Root *root = (ILibSparseArray_Root*)sarray;
+	void *retVal = NULL;
+	int i = root->bucketizer(index);
+
+	if(root->bucket[i].index == index)
+	{
+		// Direct Match
+		retVal = root->bucket[i].ptr;
+		if(remove!=0)
+		{
+			root->bucket[i].ptr = NULL;
+			root->bucket[i].index = 0;
+		}
+	}
+	else if(root->bucket[i].index < 0)
+	{
+		// Need to check the Linked List
+		void *listNode = ILibLinkedList_GetNode_Search(root->bucket[i].ptr, &ILibSparseArray_Comparer, (void*)&index);
+		retVal = listNode != NULL ? ((ILibSparseArray_Node*)ILibLinkedList_GetDataFromNode(listNode))->ptr : NULL;
+		if(remove!=0 && listNode!=NULL)
+		{
+			free(ILibLinkedList_GetDataFromNode(listNode));
+			ILibLinkedList_Remove(listNode);			
+			if(ILibLinkedList_GetCount(root->bucket[i].ptr)==0)
+			{
+				ILibLinkedList_Destroy(root->bucket[i].ptr);
+				root->bucket[i].ptr = NULL;
+				root->bucket[i].index = 0;
+			}
+		}
+	}
+	else
+	{
+		// Whatever is in this bucket doesn't match what we're looking for
+		retVal = NULL;
+	}
+	return(retVal);
+}
+void* ILibSparseArray_Get(ILibSparseArray sarray, int index)
+{
+	return(ILibSparseArray_GetEx(sarray, index, 0));
+}
+
+void* ILibSparseArray_Remove(ILibSparseArray sarray, int index)
+{
+	return(ILibSparseArray_GetEx(sarray, index, 1));
+}
+
+ILibSparseArray ILibSparseArray_Move(ILibSparseArray sarray)
+{
+	ILibSparseArray_Root *root = (ILibSparseArray_Root*)sarray;
+	ILibSparseArray_Root *retVal = (ILibSparseArray_Root*)ILibSparseArray_CreateEx(sarray);
+	memcpy(retVal->bucket, root->bucket, root->bucketSize * sizeof(ILibSparseArray_Node));
+	return(retVal);
+}
+void ILibSparseArray_ClearEx(ILibSparseArray sarray, ILibSparseArray_OnValue onClear, void *user)
+{
+	ILibSparseArray_Root *root = (ILibSparseArray_Root*)sarray;
+	int i;
+
+	for(i=0;i<root->bucketSize;++i)
+	{
+		if(root->bucket[i].ptr != NULL)
+		{
+			if(root->bucket[i].index < 0)
+			{
+				// There is a linked list here
+				void *node = ILibLinkedList_GetNode_Head(root->bucket[i].ptr);
+				while(node != NULL)
+				{
+					ILibSparseArray_Node *sn = (ILibSparseArray_Node*)ILibLinkedList_GetDataFromNode(node);
+					if(onClear!=NULL) { onClear(sarray, sn->index, sn->ptr, user);}
+					
+					free(sn);
+					node = ILibLinkedList_GetNextNode(node);
+				}
+				ILibLinkedList_Destroy(root->bucket[i].ptr);
+			}
+			else
+			{
+				// No Linked List, just a direct map
+				if(onClear!=NULL)
+				{
+					onClear(sarray, root->bucket[i].index, root->bucket[i].ptr, user);
+				}
+			}
+			root->bucket[i].index = 0;
+			root->bucket[i].ptr = NULL;
+		}
+	}
+}
+void ILibSparseArray_DestroyEx(ILibSparseArray sarray, ILibSparseArray_OnValue onDestroy, void *user)
+{
+	ILibSparseArray_ClearEx(sarray, onDestroy, user);
+	sem_destroy(&((ILibSparseArray_Root*)sarray)->LOCK);
+	free(((ILibSparseArray_Root*)sarray)->bucket);
+	free(sarray);
+}
+void ILibSparseArray_Destroy(ILibSparseArray sarray)
+{
+	ILibSparseArray_DestroyEx(sarray, NULL, NULL);
+}
+void ILibSparseArray_Lock(ILibSparseArray sarray)
+{
+	sem_wait(&(((ILibSparseArray_Root*)sarray)->LOCK));
+}
+void ILibSparseArray_UnLock(ILibSparseArray sarray)
+{
+	sem_post(&(((ILibSparseArray_Root*)sarray)->LOCK));
+}
 
 int ILibString_IndexOfFirstWhiteSpace(const char *inString, int inStringLength)
 {
@@ -6184,7 +6809,7 @@ int ILibTime_ValidateTimePortion(char *timeString)
 		pr = ILibParseString(timeString,0,length,":",1);
 		if (pr->NumResults==3 || pr->NumResults==4)
 		{
-			if (pr->FirstResult->datalength==2 && pr->FirstResult->NextResult->datalength==2)
+			if (pr->FirstResult->datalength==2 && pr->FirstResult->NextResult->datalength==2) // Klockwork says this could be NULL, but that is not possible because NumResults is 3 or 4
 			{
 				temp = ILibString_Copy(pr->FirstResult->data,pr->FirstResult->datalength);
 				if (atoi(temp)<24 && atoi(temp)>=0)
@@ -6332,7 +6957,7 @@ char* ILibTime_ValidateDatePortion(char *timeString)
 			if (pr->FirstResult->datalength==4)
 			{
 				// This means it is in yyyy-x-z format
-				if (pr->FirstResult->NextResult->datalength==2 && pr->LastResult->datalength==2)
+				if (pr->FirstResult->NextResult->datalength==2 && pr->LastResult->datalength==2) // Klockwork says this could be NULL, but that's not possible, as numresults is 3
 				{
 					// This means it is in yyyy-xx-zz format
 					startTime = ILibString_Copy(pr->FirstResult->NextResult->data,pr->FirstResult->NextResult->datalength);
@@ -6449,7 +7074,7 @@ int ILibTime_ParseEx(char *timeString, time_t *val)
 			year = pr2->FirstResult->data;
 			year[pr2->FirstResult->datalength]=0;
 
-			month = pr2->FirstResult->NextResult->data;
+			month = pr2->FirstResult->NextResult->data; // Klockwork reports this could be NULL, but that's not possible becuase NumREsults is 3
 			month[pr2->FirstResult->NextResult->datalength]=0;
 
 			day = pr2->LastResult->data;
@@ -6470,7 +7095,7 @@ int ILibTime_ParseEx(char *timeString, time_t *val)
 		//	yyyy-mm-ddThh:mm:ss-hh:mm
 		hour = pr2->FirstResult->data;
 		hour[pr2->FirstResult->datalength]=0;
-		minute = pr2->FirstResult->NextResult->data;
+		minute = pr2->FirstResult->NextResult->data; // Klockwork reports this could be NULL, but that's not possible because NumResults is 4
 		minute[pr2->FirstResult->NextResult->datalength]=0;
 		second = pr2->FirstResult->NextResult->NextResult->data;
 		second[2]=0;
@@ -6479,7 +7104,7 @@ int ILibTime_ParseEx(char *timeString, time_t *val)
 		//	yyyy-mm-ddThh:mm:ssZ
 		hour = pr2->FirstResult->data;
 		hour[pr2->FirstResult->datalength]=0;
-		minute = pr2->FirstResult->NextResult->data;
+		minute = pr2->FirstResult->NextResult->data; // Klocwork reports this could be NULL, but that's not possible becuase NumResults is 3
 		minute[pr2->FirstResult->NextResult->datalength]=0;
 		second = pr2->FirstResult->NextResult->NextResult->data;
 		second[2]=0;
@@ -6665,7 +7290,7 @@ int ILibDetectIPv6Support()
 #endif
 	}
 
-	return g_ILibDetectIPv6Support;
+	return g_ILibDetectIPv6Support; // Klocwork is being dumb. This can't be lost, because sock is getting closed if it's valid... So Klocwork is saying an invalid resource is getting lost. But we can't close an invalid handle
 }
 
 char* ILibInet_ntop2(struct sockaddr* addr, char *dst, size_t dstsize)
@@ -6728,7 +7353,7 @@ int ILibInet_pton(int af, const char *src, char *dst)
 		// Use the alternate IPv4 only version
 		char dst2[8];
 		if (af != AF_INET) return 0;
-		sscanf_s(src, "%u.%u.%u.%u", (unsigned char*)(dst2), (unsigned char*)(dst2 + 1), (unsigned char*)(dst2 + 2), (unsigned char*)(dst2 + 3));
+		sscanf_s(src, "%hhu.%hhu.%hhu.%hhu", (unsigned char*)(dst2), (unsigned char*)(dst2 + 1), (unsigned char*)(dst2 + 2), (unsigned char*)(dst2 + 3));
 		((int*)dst)[0] = ((int*)dst2)[0];
 		return 1;
 	}

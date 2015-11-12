@@ -40,12 +40,12 @@
             // 
             this.messageTextBox.Dock = System.Windows.Forms.DockStyle.Fill;
             this.messageTextBox.Location = new System.Drawing.Point(0, 0);
-            this.messageTextBox.Margin = new System.Windows.Forms.Padding(3, 2, 3, 2);
+            this.messageTextBox.Margin = new System.Windows.Forms.Padding(4, 3, 4, 3);
             this.messageTextBox.Multiline = true;
             this.messageTextBox.Name = "messageTextBox";
             this.messageTextBox.ReadOnly = true;
             this.messageTextBox.ScrollBars = System.Windows.Forms.ScrollBars.Vertical;
-            this.messageTextBox.Size = new System.Drawing.Size(613, 315);
+            this.messageTextBox.Size = new System.Drawing.Size(920, 492);
             this.messageTextBox.TabIndex = 0;
             // 
             // inputTextBox
@@ -53,9 +53,9 @@
             this.inputTextBox.Dock = System.Windows.Forms.DockStyle.Fill;
             this.inputTextBox.Enabled = false;
             this.inputTextBox.Location = new System.Drawing.Point(0, 0);
-            this.inputTextBox.Margin = new System.Windows.Forms.Padding(3, 2, 3, 2);
+            this.inputTextBox.Margin = new System.Windows.Forms.Padding(4, 3, 4, 3);
             this.inputTextBox.Name = "inputTextBox";
-            this.inputTextBox.Size = new System.Drawing.Size(500, 22);
+            this.inputTextBox.Size = new System.Drawing.Size(750, 31);
             this.inputTextBox.TabIndex = 1;
             this.inputTextBox.TextChanged += new System.EventHandler(this.inputText_TextChanged);
             this.inputTextBox.KeyUp += new System.Windows.Forms.KeyEventHandler(this.inputText_KeyUp);
@@ -64,10 +64,10 @@
             // 
             this.sendButton.Dock = System.Windows.Forms.DockStyle.Right;
             this.sendButton.Enabled = false;
-            this.sendButton.Location = new System.Drawing.Point(500, 0);
-            this.sendButton.Margin = new System.Windows.Forms.Padding(3, 2, 3, 2);
+            this.sendButton.Location = new System.Drawing.Point(750, 0);
+            this.sendButton.Margin = new System.Windows.Forms.Padding(4, 3, 4, 3);
             this.sendButton.Name = "sendButton";
-            this.sendButton.Size = new System.Drawing.Size(113, 26);
+            this.sendButton.Size = new System.Drawing.Size(170, 41);
             this.sendButton.TabIndex = 2;
             this.sendButton.Text = "Send";
             this.sendButton.UseVisualStyleBackColor = true;
@@ -80,21 +80,21 @@
             this.panel1.Controls.Add(this.inputTextBox);
             this.panel1.Controls.Add(this.sendButton);
             this.panel1.Dock = System.Windows.Forms.DockStyle.Bottom;
-            this.panel1.Location = new System.Drawing.Point(0, 315);
-            this.panel1.Margin = new System.Windows.Forms.Padding(4);
+            this.panel1.Location = new System.Drawing.Point(0, 492);
+            this.panel1.Margin = new System.Windows.Forms.Padding(6, 6, 6, 6);
             this.panel1.Name = "panel1";
-            this.panel1.Size = new System.Drawing.Size(613, 26);
+            this.panel1.Size = new System.Drawing.Size(920, 41);
             this.panel1.TabIndex = 3;
             // 
             // SessionForm
             // 
-            this.AutoScaleDimensions = new System.Drawing.SizeF(8F, 16F);
+            this.AutoScaleDimensions = new System.Drawing.SizeF(12F, 25F);
             this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Font;
-            this.ClientSize = new System.Drawing.Size(613, 341);
+            this.ClientSize = new System.Drawing.Size(920, 533);
             this.Controls.Add(this.messageTextBox);
             this.Controls.Add(this.panel1);
             this.Icon = ((System.Drawing.Icon)(resources.GetObject("$this.Icon")));
-            this.Margin = new System.Windows.Forms.Padding(3, 2, 3, 2);
+            this.Margin = new System.Windows.Forms.Padding(4, 3, 4, 3);
             this.Name = "SessionForm";
             this.StartPosition = System.Windows.Forms.FormStartPosition.CenterParent;
             this.Text = "WebRTC Session";

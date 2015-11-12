@@ -157,7 +157,7 @@ ILibAsyncUDPSocket_SocketModule ILibAsyncUDPSocket_CreateEx(void *Chain, int Buf
 		return NULL;
 	}
 	ILibAsyncSocket_UseThisSocket(RetVal, sock, &ILibAsyncUDPSocket_OnDisconnect, data);
-	return RetVal;
+	return RetVal; // Klockwork claims we could be losing the resource acquired with the call to socket(), however, we aren't becuase we are saving it with the above call to ILibAsyncSocket_UseThisSocket()
 }
 
 SOCKET ILibAsyncUDPSocket_GetSocket(ILibAsyncUDPSocket_SocketModule module)

@@ -13,6 +13,10 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+#include "ILibRemoteLogging.h"
+
+
+#define ILibTransports_Raw_WebRTC 0x50
 
 typedef enum
 {
@@ -27,7 +31,8 @@ typedef enum
 	ILibStun_Results_Symetric_NAT = 3,
 	ILibStun_Results_Restricted_NAT = 4,
 	ILibStun_Results_Port_Restricted_NAT = 5,
-	ILibStun_Results_ServerError_RFC5780_NOT_IMPLEMENTED = 10,
+	ILibStun_Results_RFC5780_NOT_IMPLEMENTED = 10,
+	ILibStun_Results_Public_Interface = 11,
 } ILibStun_Results;
 
 typedef enum
@@ -37,6 +42,16 @@ typedef enum
 	ILibWebRTC_TURN_ALWAYS_RELAY = 2	// Always relay all connections
 } ILibWebRTC_TURN_ConnectFlags;
 
+typedef enum
+{
+	ILibWebRTC_DataChannel_ReliabilityMode_RELIABLE = 0x00,
+	ILibWebRTC_DataChannel_ReliabilityMode_RELIABLE_UNORDERED = 0x80,
+	ILibWebRTC_DataChannel_ReliabilityMode_PARTIAL_RELIABLE_REXMIT = 0x01,
+	ILibWebRTC_DataChannel_ReliabilityMode_PARTIAL_RELIABLE_REXMIT_UNORDERED = 0x81,
+	ILibWebRTC_DataChannel_ReliabilityMode_PARTIAL_RELIABLE_TIMED = 0x02,
+	ILibWebRTC_DataChannel_ReliabilityMode_PARTIAL_RELIABLE_TIMED_UNORDERED = 0x82,
+}ILibWebRTC_DataChannel_ReliabilityModes;
+
 #define ILibStun_SlotToChar(val) (val>26?(val+97):(val+65))
 #define ILibStun_CharToSlot(val) (val>=97?(val-97):(val-65))
 
@@ -44,23 +59,38 @@ typedef enum
 typedef void(*ILibStunClient_OnResult)(void* StunModule, ILibStun_Results Result, struct sockaddr_in* PublicIP, void *user);
 void ILibStunClient_SetOptions(void* StunModule, SSL_CTX* securityContext, char* certThumbprintSha256);
 void* ILibStunClient_Start(void *Chain, unsigned short LocalPort, ILibStunClient_OnResult OnResult);
+void ILibStunClient_PerformNATBehaviorDiscovery(void* StunModule, struct sockaddr_in* StunServer, void *user);
 void ILibStunClient_PerformStun(void* StunModule, struct sockaddr_in* StunServer, void *user);
 void ILibStunClient_SendData(void* StunModule, struct sockaddr* target, char* data, int datalen, enum ILibAsyncSocket_MemoryOwnership UserFree);
 int ILibStun_SetIceOffer(void* StunModule, char* iceOffer, int iceOfferLen, char** answer);
 int ILibStun_SetIceOffer2(void *StunModule, char* iceOffer, int iceOfferLen, char *username, int usernameLength, char* password, int passwordLength, char** answer);
 int ILibStun_GenerateIceOffer(void* StunModule, char** offer, char* userName, char* password);
-void ILibStun_WebRTC_OpenChannel(void *WebRTCModule, unsigned short streamId, char* channelName, int channelNameLength);
 unsigned int ILibStun_CRC32(char *buf, int len);
 int ILib_Stun_GetAttributeChangeRequestPacket(int flags, char* TransactionId, char* rbuffer);
 int ILibStun_ProcessStunPacket(void* obj, char* buffer, int bufferLength, struct sockaddr_in6 *remoteInterface);
 void ILibStun_ClearIceState(void* stunModule, int iceSlot);
-int ILibWebRTC_IsDtlsInitiator(void* dtlsSession);
+
 
 // WebRTC Related Methods
+typedef enum
+{
+	ILibWebRTC_DataChannel_CloseStatus_OK = 0,
+	ILibWebRTC_DataChannel_CloseStatus_ALREADY_PENDING = 1,
+	ILibWebRTC_DataChannel_CloseStatus_ERROR = 254,
+	ILibWebRTC_DataChannel_CloseStatus_NOT_SUPPORTED = 255,
+}ILibWebRTC_DataChannel_CloseStatus;
+
+int ILibWebRTC_IsDtlsInitiator(void* dtlsSession);
+void ILibWebRTC_OpenDataChannel(void *WebRTCModule, unsigned short streamId, char* channelName, int channelNameLength);
+void ILibWebRTC_CloseDataChannel_ALL(void *WebRTCModule);
+ILibWebRTC_DataChannel_CloseStatus ILibWebRTC_CloseDataChannel(void *WebRTCModule, unsigned short streamId);
+ILibWebRTC_DataChannel_CloseStatus ILibWebRTC_CloseDataChannelEx(void *WebRTCModule, unsigned short *streamIds, int streamIdsCount);
+
 typedef int(*ILibWebRTC_OnDataChannel)(void *StunModule, void* WebRTCModule, unsigned short StreamId, char* ChannelName, int ChannelNameLength);
+typedef void(*ILibWebRTC_OnDataChannelClosed)(void *StunModule, void* WebRTCModule, unsigned short StreamId);
 typedef void(*ILibWebRTC_OnDataChannelAck)(void *StunModule, void* WebRTCModule, unsigned short StreamId);
 typedef void(*ILibWebRTC_OnOfferUpdated)(void* stunModule, char* iceOffer, int iceOfferLen);
-void ILibWebRTC_SetCallbacks(void *StunModule, ILibWebRTC_OnDataChannel OnDataChannel, ILibWebRTC_OnDataChannelAck OnDataChannelAck, ILibWebRTC_OnOfferUpdated OnOfferUpdated);
+void ILibWebRTC_SetCallbacks(void *StunModule, ILibWebRTC_OnDataChannel OnDataChannel, ILibWebRTC_OnDataChannelClosed OnDataChannelClosed, ILibWebRTC_OnDataChannelAck OnDataChannelAck, ILibWebRTC_OnOfferUpdated OnOfferUpdated);
 void ILibStun_DTLS_GetIceUserName(void* WebRTCModule, char* username);
 void ILibWebRTC_SetTurnServer(void* stunModule, struct sockaddr_in6* turnServer, char* username, int usernameLength, char* password, int passwordLength, ILibWebRTC_TURN_ConnectFlags turnFlags);
 void ILibWebRTC_DisableConsentFreshness(void *stunModule);
@@ -84,11 +114,17 @@ int ILibSCTP_Debug_SetDebugCallback(void *dtlsSession, char* debugFieldName, ILi
 typedef void(*ILibSCTP_OnConnect)(void *StunModule, void* module, int connected);
 typedef void(*ILibSCTP_OnData)(void* StunModule, void* module, unsigned short streamId, int pid, char* buffer, int bufferLen, void** user);
 typedef void(*ILibSCTP_OnSendOK)(void* StunModule, void* module, void* user);
+
+int ILibSCTP_DoesPeerSupportFeature(void* module, int feature);
+void ILibSCTP_Pause(void* module);
+void ILibSCTP_Resume(void* module);
+
 void ILibSCTP_SetCallbacks(void* StunModule, ILibSCTP_OnConnect onconnect, ILibSCTP_OnData ondata, ILibSCTP_OnSendOK onsendok);
-int ILibSCTP_Send(void* module, unsigned short streamId, char* data, int datalen);
-int ILibSCTP_SendEx(void* module, unsigned short streamId, char* data, int datalen, int dataType);
+ILibTransport_DoneState ILibSCTP_Send(void* module, unsigned short streamId, char* data, int datalen);
+ILibTransport_DoneState ILibSCTP_SendEx(void* module, unsigned short streamId, char* data, int datalen, int dataType);
 int ILibSCTP_GetPendingBytesToSend(void* module);
 void ILibSCTP_Close(void* module);
+
 void ILibSCTP_SetUser(void* module, void* user);
 void* ILibSCTP_GetUser(void* module);
 void ILibSCTP_SetUser2(void* module, void* user);

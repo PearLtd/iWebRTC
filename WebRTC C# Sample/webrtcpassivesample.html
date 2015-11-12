@@ -75,6 +75,7 @@ limitations under the License.
             msg("Channel [" + e.channel.label + "] created");
             datachannel = e.channel;
             datachannel.onmessage = function (event) { msg("Remote [" + event.currentTarget.label + "]: " + event.data); }
+            datachannel.onclose = function (event) { msg("Channel [" + event.currentTarget.label + "] was closed by remote"); }
         }
 
         function onUserKeyPressEvent(event) {

@@ -88,13 +88,6 @@ extern char* ILibCriticalLogFilename;
 #include <fcntl.h>
 #include <signal.h>
 #define UNREFERENCED_PARAMETER(P)
-#elif defined(__SYMBIAN32__)
-#include <libc\stddef.h>
-#include <libc\sys\types.h>
-#include <libc\sys\socket.h>
-#include <libc\netinet\in.h>
-#include <libc\arpa\inet.h>
-#include <libc\sys\time.h>
 #endif
 
 #include <stdlib.h>
@@ -110,6 +103,8 @@ extern char* ILibCriticalLogFilename;
 #include <winbase.h>
 #endif
 
+#include "ILibRemoteLogging.h"
+
 #ifdef __APPLE__
 #include <pthread.h>
 #define sem_t pthread_mutex_t
@@ -123,15 +118,6 @@ extern char* ILibCriticalLogFilename;
 #if defined(WIN32) && !defined(_WIN32_WCE)
 #include <time.h>
 #include <sys/timeb.h>
-#endif
-#if defined(__SYMBIAN32__)
-#include "ILibSymbianSemaphore.h"
-#define sem_t void*
-#define sem_init(x,pShared,InitValue) ILibSymbian_CreateSemaphore(x,InitValue)
-#define sem_destroy(x) ILibSymbian_DestroySemaphore(x)
-#define sem_wait(x) ILibSymbian_WaitSemaphore(x)
-#define sem_trywait(x) ILibSymbian_TryWaitSemaphore(x)
-#define sem_post(x) ILibSymbian_SignalSemaphore(x)
 #endif
 
 #if defined(_DEBUG)
@@ -189,9 +175,14 @@ extern char* ILibCriticalLogFilename;
 #endif
 #endif
 
+#if !defined(WIN32) 
+#define __fastcall
+#endif
+
 	typedef void (*voidfp)(void);		// Generic function pointer
 	extern char ILibScratchPad[4096];   // General buffer
 	extern char ILibScratchPad2[65536]; // Often used for UDP packet processing
+	extern void* gILibChain;			// Global Chain used for Remote Logging when a chain instance is not otherwise exposed
 
 	/*! \def UPnPMIN(a,b)
 	Returns the minimum of \a a and \a b.
@@ -205,7 +196,7 @@ extern char* ILibCriticalLogFilename;
 
 	int ILibIsRunningOnChainThread(void* chain);
 
-	typedef enum
+	typedef enum ILibServerScope
 	{
 		ILibServerScope_All=0,
 		ILibServerScope_LocalLoopback=1,
@@ -213,9 +204,48 @@ extern char* ILibCriticalLogFilename;
 	}ILibServerScope;
 
 
-	typedef	void(*ILibChain_PreSelect)(void* object,void *readset, void *writeset, void *errorset, int* blocktime);
-	typedef	void(*ILibChain_PostSelect)(void* object,int slct, void *readset, void *writeset, void *errorset);
+	typedef	void(*ILibChain_PreSelect)(void* object, fd_set *readset, fd_set *writeset, fd_set *errorset, int* blocktime);
+	typedef	void(*ILibChain_PostSelect)(void* object, int slct, fd_set *readset, fd_set *writeset, fd_set *errorset);
 	typedef	void(*ILibChain_Destroy)(void* object);
+	typedef void(*ILibChain_DestroyEvent)(void *chain, void *user);
+	typedef void(*ILibChain_StartEvent)(void *chain, void *user);
+
+#ifdef _REMOTELOGGING
+	#define ILibChainSetLogger(chain, logger) ((void**)&((int*)chain)[2])[0] = logger
+	#define ILibChainGetLogger(chain) (chain!=NULL?(((void**)&((int*)chain)[2])[0]):NULL)
+	#ifdef _REMOTELOGGINGSERVER
+		unsigned short ILibStartDefaultLogger(void* chain, unsigned short portNumber);
+	#else
+		#define ILibStartDefaultLogger(chain, portNumber) 0
+	#endif
+#else
+	#define ILibChainSetLogger(chain, logger) ;
+	#define ILibChainGetLogger(chain) NULL
+	#define ILibStartDefaultLogger(chain, portNumber) 0
+#endif
+
+#define ILibTransportChain(transport) ((ILibTransport*)transport)->Chain
+
+	void ILibChain_OnDestroyEvent_AddHandler(void *chain, ILibChain_DestroyEvent sink, void *user);
+	void ILibChain_OnStartEvent_AddHandler(void *chain, ILibChain_StartEvent sink, void *user);
+
+#ifdef MICROSTACK_NOTLS
+	#define NONCE_SIZE        32
+	#define HALF_NONCE_SIZE   16
+
+	char* __fastcall util_tohex(char* data, int len, char* out);
+	int __fastcall util_hexToint(char *hexString, int hexStringLength);
+
+	// Convert hex string to int 
+	int __fastcall util_hexToBuf(char *hexString, int hexStringLength, char* output);
+	// Perform a MD5 hash on the data
+	void __fastcall util_md5(char* data, int datalen, char* result);
+
+	// Perform a MD5 hash on the data and convert result to HEX and store in output
+	// This is useful for HTTP Digest
+	void __fastcall util_md5hex(char* data, int datalen, char *out);
+#endif
+
 
 	int ILibGetCurrentTimezoneOffset_Minutes();
 	int ILibIsDaylightSavingsTime();
@@ -236,9 +266,38 @@ extern char* ILibCriticalLogFilename;
 	int ILibReaderWriterLock_WriteUnLock(ILibReaderWriterLock rwLock);
 	void ILibReaderWriterLock_Destroy(ILibReaderWriterLock rwLock);
 
-#if defined(__SYMBIAN32__)
-	typedef void (*ILibOnChainStopped)(void *user);
-#endif
+	typedef enum ILibTransport_MemoryOwnership
+	{
+		ILibTransport_MemoryOwnership_CHAIN = 0, /*!< The Microstack will own this memory, and free it when it is done with it */
+		ILibTransport_MemoryOwnership_STATIC = 1, /*!< This memory is static, so the Microstack will not free it, and assume it will not go away, so it won't copy it either */
+		ILibTransport_MemoryOwnership_USER = 2 /*!< The Microstack doesn't own this memory, so if necessary the memory will be copied */
+	}ILibTransport_MemoryOwnership;
+	typedef enum ILibTransport_DoneState
+	{
+		ILibTransport_DoneState_INCOMPLETE = 0, 
+		ILibTransport_DoneState_COMPLETE = 1,
+		ILibTransport_DoneState_ERROR	= -4
+	}ILibTransport_DoneState;
+
+	typedef ILibTransport_DoneState(*ILibTransport_SendPtr)(void *transport, char* buffer, int bufferLength, ILibTransport_MemoryOwnership ownership, ILibTransport_DoneState done);
+	typedef void(*ILibTransport_ClosePtr)(void *transport);
+	typedef unsigned int(*ILibTransport_PendingBytesToSendPtr)(void *transport);
+
+	ILibTransport_DoneState ILibTransport_Send(void *transport, char* buffer, int bufferLength, ILibTransport_MemoryOwnership ownership, ILibTransport_DoneState done);
+	void ILibTransport_Close(void *transport);
+	unsigned int ILibTransport_PendingBytesToSend(void *transport);
+
+	typedef struct ILibTransport
+	{
+		void* Reserved[3];
+		void* Chain;	
+		ILibTransport_SendPtr Send;
+		ILibTransport_ClosePtr Close;
+		ILibTransport_PendingBytesToSendPtr PendingBytes;	
+		unsigned int IdentifierFlags;
+	}ILibTransport;
+
+
 
 	/*! \defgroup DataStructures Data Structures
 	\ingroup ILibParsers
@@ -332,7 +391,7 @@ extern char* ILibCriticalLogFilename;
 	\par
 	This can be created manually by calling \a ILibCreateEmptyPacket(), or automatically via a call to \a ILibParsePacketHeader(...)
 	*/
-	struct packetheader
+	typedef struct packetheader
 	{
 		/*! \var Directive
 		\brief HTTP Method
@@ -432,7 +491,7 @@ extern char* ILibCriticalLogFilename;
 		char ReceivingAddress[30];
 
 		void *HeaderTable;
-	};
+	}ILibHTTPPacket;
 
 	/*! \struct ILibXMLNode
 	\brief An XML Tree
@@ -567,15 +626,16 @@ extern char* ILibCriticalLogFilename;
 	Queue Methods
 	\{
 	*/
-	void *ILibQueue_Create();
-	void ILibQueue_Destroy(void *q);
-	int ILibQueue_IsEmpty(void *q);
-	void ILibQueue_EnQueue(void *q, void *data);
-	void *ILibQueue_DeQueue(void *q);
-	void *ILibQueue_PeekQueue(void *q);
-	void ILibQueue_Lock(void *q);
-	void ILibQueue_UnLock(void *q);
-	long ILibQueue_GetCount(void *q);
+	typedef void* ILibQueue;
+	ILibQueue ILibQueue_Create();
+	void ILibQueue_Destroy(ILibQueue q);
+	int ILibQueue_IsEmpty(ILibQueue q);
+	void ILibQueue_EnQueue(ILibQueue q, void *data);
+	void *ILibQueue_DeQueue(ILibQueue q);
+	void *ILibQueue_PeekQueue(ILibQueue q);
+	void ILibQueue_Lock(ILibQueue q);
+	void ILibQueue_UnLock(ILibQueue q);
+	long ILibQueue_GetCount(ILibQueue q);
 	/* \} */
 
 
@@ -658,18 +718,66 @@ extern char* ILibCriticalLogFilename;
 	void *ILibGetBaseTimer(void *chain);
 	void ILibChain_SafeAdd(void *chain, void *object);
 	void ILibChain_SafeRemove(void *chain, void *object);
-	void ILibChain_SafeAdd_SubChain(void *chain, void *subChain);
-	void ILibChain_SafeRemove_SubChain(void *chain, void *subChain);
 	void ILibChain_DestroyEx(void *chain);
 	void ILibStartChain(void *chain);
 	void ILibStopChain(void *chain);
-#if defined(__SYMBIAN32__)
-	void ILibChain_SetOnStoppedHandler(void *chain, void *user, ILibOnChainStopped Handler);
-#endif
+
 	void ILibForceUnBlockChain(void *Chain);
 	/* \} */
 
 
+	typedef void* ILibSparseArray;
+	typedef int(*ILibSparseArray_Bucketizer)(int value);
+	typedef void(*ILibSparseArray_OnValue)(ILibSparseArray sender, int index, void *value, void *user);
+
+	// Allocates a new SparseArray using the specified number of buckets and the given bucketizer method, which maps indexes to buckets.
+	ILibSparseArray ILibSparseArray_Create(int numberOfBuckets, ILibSparseArray_Bucketizer bucketizer);
+
+	// Allocates a new SparseArray using the same parameters as an existing SparseArray
+	ILibSparseArray ILibSparseArray_CreateEx(ILibSparseArray source);
+
+	// Populates the "index" in the SparseArray. If that index is already defined, the new value is saved, and the old value is returned. 
+	void* ILibSparseArray_Add(ILibSparseArray sarray, int index, void *data);
+	
+	// Fetches the value of the index. NULL if the index is not defined
+	void* ILibSparseArray_Get(ILibSparseArray sarray, int index);
+
+	// Removes an index from the SparseArray (if it exists), and returns the associated value if it does exist.
+	void* ILibSparseArray_Remove(ILibSparseArray sarray, int index);
+
+	// Destroys the SparseArray
+	void ILibSparseArray_Destroy(ILibSparseArray sarray);
+
+	// Destroys the SparseArray, and calls the OnDestroy delegate for each index that was defined, passing the index and associated value
+	void ILibSparseArray_DestroyEx(ILibSparseArray sarray, ILibSparseArray_OnValue onDestroy, void *user);
+
+	// Clears the SparseArray, and calls the OnClear delegate for each index that was defined, passing the index and associated value
+	void ILibSparseArray_ClearEx(ILibSparseArray sarray, ILibSparseArray_OnValue onClear, void *user);
+
+	// Moves the Buckets from one SparseArray to another SparseArray
+	ILibSparseArray ILibSparseArray_Move(ILibSparseArray sarray);
+
+	void ILibSparseArray_Lock(ILibSparseArray sarray);
+	void ILibSparseArray_UnLock(ILibSparseArray sarray);
+
+	typedef void* ILibHashtable;
+	typedef int(*ILibHashtable_Hash_Func)(void* Key1, char* Key2, int Key2Len);
+	typedef void(*ILibHashtable_OnDestroy)(ILibHashtable sender, void *Key1, char* Key2, int Key2Len, void *Data, void *user);
+
+	ILibHashtable ILibHashtable_Create();
+
+	void ILibHashtable_DestroyEx(ILibHashtable table, ILibHashtable_OnDestroy onDestroy, void *user);
+	#define ILibHashtable_Destroy(hashtable) ILibHashtable_DestroyEx(hashtable, NULL, NULL)
+	void ILibHashtable_ChangeHashFunc(ILibHashtable table, ILibHashtable_Hash_Func hashFunc);
+	void ILibHashtable_ChangeBucketizer(ILibHashtable table, int bucketCount, ILibSparseArray_Bucketizer bucketizer);
+	void* ILibHashtable_Put(ILibHashtable table, void *Key1, char* Key2, int Key2Len, void* Data);
+	void* ILibHashtable_Get(ILibHashtable table, void *Key1, char* Key2, int Key2Len);
+	void* ILibHashtable_Remove(ILibHashtable table, void *Key1, char* Key2, int Key2Len);
+	void ILibHashtable_Lock(ILibHashtable table);
+	void ILibHashtable_UnLock(ILibHashtable table);
+
+
+	ILibHashtable ILibChain_GetBaseHashtable(void* chain);
 
 	/*! \defgroup LinkedListGroup Linked List
 	\ingroup DataStructures
@@ -681,6 +789,24 @@ extern char* ILibCriticalLogFilename;
 	// Initializes a new Linked List data structre
 	//
 	void* ILibLinkedList_Create();
+	void ILibLinkedList_SetTag(ILibLinkedList list, void *tag);
+	void* ILibLinkedList_GetTag(ILibLinkedList list);
+
+	// Comparer delegate is called to compare two values. Mimics behavior of .NET IComparer..
+	// obj2 == obj1	: 0
+	// obj2 < obj1	: -1
+	// obj2 > obj1	: +1
+	typedef int(*ILibLinkedList_Comparer)(void* obj1, void *obj2);
+
+	// Chooser delegate is called when a new item is to be added to Linked List. The old value is passed in as well as the new value... The return value is set to the added node
+	typedef void*(*ILibLinkedList_Chooser)(void* oldObject, void *newObject, void *user);
+
+	// Uses the given comparer to insert data into the list. A Duplicate (according to comparer) will result in the value being updated, and the old value being returned
+	void* ILibLinkedList_SortedInsert(void* LinkedList, ILibLinkedList_Comparer comparer, void *data);
+	void ILibLinkedList_SortedInsertEx(void* LinkedList, ILibLinkedList_Comparer comparer, ILibLinkedList_Chooser chooser, void *data, void *user);
+
+	// Uses the given comparer to return the Linked List node that is reported as a match to matchWith. Returns NULL if not found.
+	void* ILibLinkedList_GetNode_Search(void* LinkedList, ILibLinkedList_Comparer comparer, void *matchWith);
 
 	//
 	// Returns the Head node of a linked list data structure
@@ -934,6 +1060,8 @@ extern char* ILibCriticalLogFilename;
 	void ILibAddHeaderLine(struct packetheader *packet, const char* FieldName, int FieldNameLength, const char* FieldData, int FieldDataLength);
 	void ILibDeleteHeaderLine(struct packetheader *packet, char* FieldName, int FieldNameLength);
 
+	char* ILibUrl_GetHost(char *url, int urlLen);
+
 	//
 	// Fetches the header value from the packet. (String is NOT copied)
 	// Returns NULL if the header field does not exist
@@ -1070,6 +1198,8 @@ extern char* ILibCriticalLogFilename;
 	void  ILibEndThisThread();
 
 	char* ILibToHex(char* data, int len, char* out);
+	int ILibWhichPowerOfTwo(int number);
+#define ILibPowerOfTwo(exponent) (0x01 << exponent)
 
 #ifdef __cplusplus
 }

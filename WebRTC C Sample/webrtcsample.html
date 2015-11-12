@@ -23,10 +23,12 @@ limitations under the License.
 <body onload="start()" onunload="stop()">
     <span id="outputtext"></span>
     <hr />
+    <input type="button" value="Close Channel" onclick="closeChannel()" />
     <textarea id="inputtext" style="width:100%" onkeypress="onUserKeyPressEvent(event)"></textarea>
     <script type="text/javascript">
         var connection = null;
         var datachannel = null;
+        var receiveChannel = null;
         var configuration = { "iceServers": [/*{{{ICESERVERS}}}*/] };
         var currentoffer = null;
         var requester;
@@ -35,7 +37,9 @@ limitations under the License.
         var inputtextbox = document.getElementById("inputtext");
 
         function stop() { connection.close(); }
-
+        function closeChannel() {
+            receiveChannel.close();
+        }
         function start() {
             msg("Starting...");
 
@@ -44,9 +48,11 @@ limitations under the License.
             else if (typeof webkitRTCPeerConnection !== 'undefined') { connection = new webkitRTCPeerConnection(configuration); }
             else return false;
 
-            datachannel = connection.createDataChannel("sampleDataChannel", { reliable: true });
+            //datachannel = connection.createDataChannel("sampleDataChannel", { ordered: false, maxRetransmits: 2 });
+            datachannel = connection.createDataChannel("sampleDataChannel", {});
             datachannel.onmessage = function (event) { msg("Remote: " + event.data); };
             datachannel.onopen = function () { msg("Connected."); };
+            datachannel.onclose = function (event) { msg("DataChannel was closed by remote"); }
 
             connection.ondatachannel = onNewDataChannel;
             connection.onicecandidate = onIceCandidate;
@@ -62,15 +68,17 @@ limitations under the License.
             }
         }
 
-        function onNewDataChannel(e) {
-            alert("Channel [" + e.channel.label + "] created!");
-            e.channel.onmessage = onChannelMessage;
-        }        function onChannelMessage(e) {
-            alert("Received message on channel [" + e.target.label + "]: " + e.data);
+        function onNewDataChannel(e)
+        {
+            msg("Channel [" + e.channel.label + "] created");
+            receiveChannel = e.channel;
+            receiveChannel.onmessage = function (event) { msg("Remote: " + event.data); }
+            receiveChannel.onclose = function (event) { msg("receiveChannel was closed by remote"); }
         }
 
         function onUserKeyPressEvent(event) {
-            if (event.keyCode == 13) {
+            if (event.keyCode == 13)
+            {
                 datachannel.send(inputtextbox.value);
                 msg("Local: " + inputtextbox.value);
                 inputtextbox.value = "";
@@ -90,7 +98,7 @@ limitations under the License.
                 requester = new XMLHttpRequest();
                 requester.onload = initiatorResponse;
                 requester.onerror = initiatorErrorResponse;
-                requester.open("POST", "http://{{{OFFER_URL}}}", true);
+                requester.open("POST", window.location.protocol + "//" + window.location.host, true);
                 requester.send(sdp);
                 
                 return;

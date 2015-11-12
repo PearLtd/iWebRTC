@@ -45,6 +45,7 @@ limitations under the License.
 
 #include "ILibParsers.h"
 #include "ILibAsyncSocket.h"
+#include "ILibRemoteLogging.h"
 
 #ifndef MICROSTACK_NOTLS
 #include <openssl/err.h>
@@ -57,7 +58,7 @@ limitations under the License.
 
 #define INET_SOCKADDR_LENGTH(x) ((x==AF_INET6?sizeof(struct sockaddr_in6):sizeof(struct sockaddr_in)))
 
-#if defined(WIN32) && !defined(snprintf) && _MSC_VER < 1900
+#if defined(WIN32) && !defined(snprintf) && (_MSC_PLATFORM_TOOLSET <= 120)
 #define snprintf(dst, len, frm, ...) _snprintf_s(dst, len, _TRUNCATE, frm, __VA_ARGS__)
 #endif
 
@@ -113,6 +114,11 @@ struct ILibAsyncSocketModule
 	void (*PostSelect)(void* object,int slct, fd_set *readset, fd_set *writeset, fd_set *errorset);
 	void (*Destroy)(void* object);
 	void *Chain;
+	ILibTransport_SendPtr sendPtr;
+	ILibTransport_ClosePtr closePtr;	
+	ILibTransport_PendingBytesToSendPtr pendingPtr;
+	unsigned int IdentifierFlags;
+	// DO NOT MODIFY THE ABOVE FIELDS (ILibTransport)
 
 	unsigned int PendingBytesToSend;
 	unsigned int TotalBytesSent;
@@ -180,11 +186,62 @@ struct ILibAsyncSocketModule
 	int  sslstate;
 	BIO* sslbio;
 	SSL_CTX *ssl_ctx;
+#ifdef MICROSTACK_TLS_DETECT
+	int TLSChecked;
+#endif
 	#endif
 };
 
 void ILibAsyncSocket_PostSelect(void* object,int slct, fd_set *readset, fd_set *writeset, fd_set *errorset);
 void ILibAsyncSocket_PreSelect(void* object,fd_set *readset, fd_set *writeset, fd_set *errorset, int* blocktime);
+
+
+typedef enum ILibAsyncSocket_TLSPlainText_ContentType
+{
+	ILibAsyncSocket_TLSPlainText_ContentType_ChangeCipherSpec = 20,
+	ILibAsyncSocket_TLSPlainText_ContentType_Alert = 21,
+	ILibAsyncSocket_TLSPlainText_ContentType_Handshake = 22,
+	ILibAsyncSocket_TLSPlainText_ContentType_ApplicationData = 23
+}ILibAsyncSocket_TLSPlainText_ContentType;
+typedef enum ILibAsyncSocket_TLSHandshakeType
+{
+	ILibAsyncSocket_TLSHandshakeType_hello = 0,
+	ILibAsyncSocket_TLSHandshakeType_clienthello = 1,
+	ILibAsyncSocket_TLSHandshakeType_serverhello = 2,
+	ILibAsyncSocket_TLSHandshakeType_certificate = 11,
+	ILibAsyncSocket_TLSHandshakeType_serverkeyexchange = 12,
+	ILibAsyncSocket_TLSHandshakeType_certificaterequest = 13,
+	ILibAsyncSocket_TLSHandshakeType_serverhellodone = 14,
+	ILibAsyncSocket_TLSHandshakeType_certificateverify = 15,
+	ILibAsyncSocket_TLSHandshakeType_clientkeyexchange = 16,
+	ILibAsyncSocket_TLSHandshakeType_finished = 20
+}ILibAsyncSocket_TLSHandshakeType;
+
+#ifndef MICROSTACK_NOTLS
+int ILibAsyncSocket_TLSDetect(char* buffer, int offset, int endPointer)
+{
+	ILibAsyncSocket_TLSPlainText_ContentType contentType = (ILibAsyncSocket_TLSPlainText_ContentType)buffer[offset+0];
+	unsigned char versionMajor = buffer[offset+1];
+	//unsigned char versionMinor = buffer[offset+2];
+	//unsigned short length = ntohs(((unsigned short*)(buffer+offset+3))[0]);
+	ILibAsyncSocket_TLSHandshakeType tlsHandshakeType = (ILibAsyncSocket_TLSHandshakeType)(buffer+offset+5)[0];
+
+	UNREFERENCED_PARAMETER(endPointer);
+
+	if(contentType == ILibAsyncSocket_TLSPlainText_ContentType_Handshake && versionMajor >= 1 && (tlsHandshakeType == ILibAsyncSocket_TLSHandshakeType_hello || tlsHandshakeType == ILibAsyncSocket_TLSHandshakeType_clienthello || tlsHandshakeType == ILibAsyncSocket_TLSHandshakeType_serverhello))
+	{
+		return(1);
+	}
+	else
+	{
+		return(0);
+	}
+}
+int ILibAsyncSocket_IsUsingTls(ILibAsyncSocket_SocketModule AsyncSocketToken)
+{
+	return(((struct ILibAsyncSocketModule*)AsyncSocketToken)->ssl != NULL ? 1:0);
+}
+#endif
 
 //
 // An internal method called by Chain as Destroy, to cleanup AsyncSocket
@@ -263,6 +320,12 @@ void ILibAsyncSocket_SetReAllocateNotificationCallback(ILibAsyncSocket_SocketMod
 	if (AsyncSocketToken != NULL) { ((struct ILibAsyncSocketModule*)AsyncSocketToken)->OnBufferReAllocated = Callback; }
 }
 
+ILibTransport_DoneState ILibAsyncSocket_TransportSend(void *transport, char* buffer, int bufferLength, ILibTransport_MemoryOwnership ownership, ILibTransport_DoneState done)
+{
+	UNREFERENCED_PARAMETER(done);
+	return((ILibTransport_DoneState)ILibAsyncSocket_Send(transport, buffer, bufferLength, (enum ILibAsyncSocket_MemoryOwnership)ownership));
+}
+
 /*! \fn ILibCreateAsyncSocketModule(void *Chain, int initialBufferSize, ILibAsyncSocket_OnData OnData, ILibAsyncSocket_OnConnect OnConnect, ILibAsyncSocket_OnDisconnect OnDisconnect,ILibAsyncSocket_OnSendOK OnSendOK)
 \brief Creates a new AsyncSocketModule
 \param Chain The chain to add this module to. (Chain must <B>not</B> be running)
@@ -278,6 +341,11 @@ ILibAsyncSocket_SocketModule ILibCreateAsyncSocketModule(void *Chain, int initia
 	struct ILibAsyncSocketModule *RetVal = (struct ILibAsyncSocketModule*)malloc(sizeof(struct ILibAsyncSocketModule));
 	if (RetVal == NULL) return NULL;
 	memset(RetVal, 0, sizeof(struct ILibAsyncSocketModule));
+	RetVal->IdentifierFlags = ILibTransports_AsyncSocket;
+	RetVal->sendPtr = &ILibAsyncSocket_TransportSend;
+	RetVal->closePtr = &ILibAsyncSocket_Disconnect;
+	RetVal->pendingPtr = &ILibAsyncSocket_GetPendingBytesToSend;
+
 	if (initialBufferSize != 0)
 	{
 		// Use a new buffer
@@ -346,8 +414,8 @@ enum ILibAsyncSocket_SendStatus ILibAsyncSocket_SendTo(ILibAsyncSocket_SocketMod
 {
 	struct ILibAsyncSocketModule *module = (struct ILibAsyncSocketModule*)socketModule;
 	struct ILibAsyncSocket_SendData *data;
-	int unblock = 0;
 	int bytesSent = 0;
+	enum ILibAsyncSocket_SendStatus retVal = ILibAsyncSocket_ALL_DATA_SENT;
 
 	// If the socket is empty, return now.
 	if (socketModule == NULL) return ILibAsyncSocket_SEND_ON_CLOSED_SOCKET_ERROR;
@@ -392,7 +460,9 @@ enum ILibAsyncSocket_SendStatus ILibAsyncSocket_SendTo(ILibAsyncSocket_SocketMod
 			module->PendingSend_Tail->Next = data;
 			module->PendingSend_Tail = data;
 		}
-		unblock = 1;
+		
+		retVal = ILibAsyncSocket_NOT_ALL_DATA_SENT_YET;
+
 		if (UserFree == ILibAsyncSocket_MemoryOwnership_USER)
 		{
 			// If we don't own this memory, we need to copy the buffer,
@@ -415,7 +485,7 @@ enum ILibAsyncSocket_SendStatus ILibAsyncSocket_SendTo(ILibAsyncSocket_SocketMod
 			if (module->ssl == NULL)
 			{
 				// Send on non-SSL socket, set MSG_NOSIGNAL since we don't want to get Broken Pipe signals in Linux, ignored if Windows.
-				bytesSent = send(module->internalSocket, module->PendingSend_Head->buffer + module->PendingSend_Head->bytesSent, module->PendingSend_Head->bufferSize-module->PendingSend_Head->bytesSent, MSG_NOSIGNAL);
+				bytesSent = send(module->internalSocket, module->PendingSend_Head->buffer + module->PendingSend_Head->bytesSent, module->PendingSend_Head->bufferSize-module->PendingSend_Head->bytesSent, MSG_NOSIGNAL); // Klocwork reports that this could block while holding a lock... This socket has been set to O_NONBLOCK, so that will never happen
 			}
 			else
 			{
@@ -425,7 +495,7 @@ enum ILibAsyncSocket_SendStatus ILibAsyncSocket_SendTo(ILibAsyncSocket_SocketMod
 		}
 		else
 		{
-			bytesSent = sendto(module->internalSocket, module->PendingSend_Head->buffer+module->PendingSend_Head->bytesSent, module->PendingSend_Head->bufferSize-module->PendingSend_Head->bytesSent, MSG_NOSIGNAL, (struct sockaddr*)remoteAddress, INET_SOCKADDR_LENGTH(remoteAddress->sa_family));
+			bytesSent = sendto(module->internalSocket, module->PendingSend_Head->buffer+module->PendingSend_Head->bytesSent, module->PendingSend_Head->bufferSize-module->PendingSend_Head->bytesSent, MSG_NOSIGNAL, (struct sockaddr*)remoteAddress, INET_SOCKADDR_LENGTH(remoteAddress->sa_family)); // Klocwork reports that this could block while holding a lock... This socket has been set to O_NONBLOCK, so that will never happen
 		}
 		#else
 		if (remoteAddress == NULL)
@@ -523,14 +593,14 @@ enum ILibAsyncSocket_SendStatus ILibAsyncSocket_SendTo(ILibAsyncSocket_SocketMod
 				MEMCHECK(assert(length <= data->bufferSize);)
 				data->UserFree = ILibAsyncSocket_MemoryOwnership_CHAIN;
 			}
-			unblock = 1;
+			retVal = ILibAsyncSocket_NOT_ALL_DATA_SENT_YET;
 		}
 
 	}
 	SEM_TRACK(AsyncSocket_TrackUnLock("ILibAsyncSocket_Send", 4, module);)
 	sem_post(&(module->SendLock));
-	if (unblock != 0) ILibForceUnBlockChain(module->Chain);
-	return (enum ILibAsyncSocket_SendStatus)unblock;
+	if (retVal != ILibAsyncSocket_ALL_DATA_SENT) ILibForceUnBlockChain(module->Chain);
+	return (retVal);
 }
 
 /*! \fn ILibAsyncSocket_Disconnect(ILibAsyncSocket_SocketModule socketModule)
@@ -549,6 +619,8 @@ void ILibAsyncSocket_Disconnect(ILibAsyncSocket_SocketModule socketModule)
 	#endif
 
 	struct ILibAsyncSocketModule *module = (struct ILibAsyncSocketModule*)socketModule;
+
+	ILibRemoteLogging_printf(ILibChainGetLogger(module->Chain), ILibRemoteLogging_Modules_Microstack_AsyncSocket, ILibRemoteLogging_Flags_VerbosityLevel_1, "AsyncSocket[%p] << DISCONNECT", (void*)module);
 
 	SEM_TRACK(AsyncSocket_TrackLock("ILibAsyncSocket_Disconnect", 1, module);)
 	sem_wait(&(module->SendLock));
@@ -855,6 +927,10 @@ void ILibProcessAsyncSocket(struct ILibAsyncSocketModule *Reader, int pendingRea
 		Reader->BeginPointer = 0;
 		Reader->EndPointer = 0;
 	}
+	if (Reader->PAUSE > 0)
+	{
+		ILibRemoteLogging_printf(ILibChainGetLogger(Reader->Chain), ILibRemoteLogging_Modules_Microstack_AsyncSocket, ILibRemoteLogging_Flags_VerbosityLevel_2, "AsyncSocket[%p] is PAUSED", (void*)Reader);
+	}
 	if (!pendingRead || Reader->PAUSE > 0) return;
 
 	//
@@ -907,6 +983,7 @@ void ILibProcessAsyncSocket(struct ILibAsyncSocketModule *Reader, int pendingRea
 			//
 			// If we grow the buffer anymore, it will exceed the maximum allowed buffer size
 			//
+			ILibRemoteLogging_printf(ILibChainGetLogger(Reader->Chain), ILibRemoteLogging_Modules_Microstack_AsyncSocket, ILibRemoteLogging_Flags_VerbosityLevel_1, "AsyncSocket[%p] Exceeded Max Buffer Size %d bytes", (void*)Reader, Reader->MaxBufferSize);
 			Reader->MaxBufferSizeExceeded = 1;
 			if (Reader->OnBufferSizeExceeded != NULL) Reader->OnBufferSizeExceeded(Reader, Reader->MaxBufferSizeUserObject);
 			ILibAsyncSocket_Disconnect(Reader);
@@ -932,6 +1009,21 @@ void ILibProcessAsyncSocket(struct ILibAsyncSocketModule *Reader, int pendingRea
 	}
 
 	#ifndef MICROSTACK_NOTLS
+#ifdef MICROSTACK_TLS_DETECT
+	if(Reader->ssl != NULL && Reader->TLSChecked == 0)
+	{
+		bytesReceived = recv(Reader->internalSocket, Reader->buffer, Reader->MallocSize, MSG_PEEK);
+		if(ILibAsyncSocket_TLSDetect(Reader->buffer, 0, bytesReceived)==0)
+		{
+			Reader->ssl = NULL;
+			if(Reader->OnConnect!=NULL)
+			{
+				if (Reader->OnConnect != NULL) Reader->OnConnect(Reader, -1, Reader->user);
+			}
+		}
+		Reader->TLSChecked = 1;
+	}
+#endif
 	if (Reader->ssl != NULL)
 	{
 		// Read data off the SSL socket.
@@ -1019,6 +1111,7 @@ void ILibProcessAsyncSocket(struct ILibAsyncSocketModule *Reader, int pendingRea
 		bytesReceived = recvfrom(Reader->internalSocket, Reader->buffer+Reader->EndPointer, Reader->MallocSize-Reader->EndPointer, 0, (struct sockaddr*)&(Reader->SourceAddress), (socklen_t*)&len);
 #endif
 		ILib6to4((struct sockaddr*)&(Reader->SourceAddress));
+		ILibRemoteLogging_printf(ILibChainGetLogger(Reader->Chain), ILibRemoteLogging_Modules_Microstack_AsyncSocket, ILibRemoteLogging_Flags_VerbosityLevel_2, "AsyncSocket[%p] recv (NON-TLS) returned %d", (void*)Reader, bytesReceived);
 	}
 
 	sem_wait(&(Reader->SendLock));
@@ -1154,6 +1247,10 @@ void ILibProcessAsyncSocket(struct ILibAsyncSocketModule *Reader, int pendingRea
 			Reader->EndPointer = 0;
 		}
 	}
+	if (Reader->PAUSE > 0) 
+	{
+		ILibRemoteLogging_printf(ILibChainGetLogger(Reader->Chain), ILibRemoteLogging_Modules_Microstack_AsyncSocket, ILibRemoteLogging_Flags_VerbosityLevel_2, "AsyncSocket[%p] is PAUSED", (void*)Reader);
+	}
 }
 
 /*! \fn ILibAsyncSocket_GetUser(ILibAsyncSocket_SocketModule socketModule)
@@ -1206,6 +1303,8 @@ void ILibAsyncSocket_PreSelect(void* socketModule,fd_set *readset, fd_set *write
 	struct ILibAsyncSocketModule *module = (struct ILibAsyncSocketModule*)socketModule;
 	if (module->internalSocket == -1) return; // If there is not internal socket, just return now.
 
+	ILibRemoteLogging_printf(ILibChainGetLogger(module->Chain), ILibRemoteLogging_Modules_Microstack_AsyncSocket, ILibRemoteLogging_Flags_VerbosityLevel_5, "AsyncSocket[%p] entered PreSelect", (void*)module);
+
 	SEM_TRACK(AsyncSocket_TrackLock("ILibAsyncSocket_PreSelect", 1, module);)
 	sem_wait(&(module->SendLock));
 
@@ -1257,6 +1356,8 @@ void ILibAsyncSocket_PreSelect(void* socketModule,fd_set *readset, fd_set *write
 	}
 	SEM_TRACK(AsyncSocket_TrackUnLock("ILibAsyncSocket_PreSelect", 2, module);)
 	sem_post(&(module->SendLock));
+
+	ILibRemoteLogging_printf(ILibChainGetLogger(module->Chain), ILibRemoteLogging_Modules_Microstack_AsyncSocket, ILibRemoteLogging_Flags_VerbosityLevel_5, "...AsyncSocket[%p] exited PreSelect", (void*)module);
 }
 
 void ILibAsyncSocket_PrivateShutdown(void* socketModule)
@@ -1337,6 +1438,9 @@ void ILibAsyncSocket_PostSelect(void* socketModule, int slct, fd_set *readset, f
 	fd_error = FD_ISSET(module->internalSocket, errorset);
 	fd_read = FD_ISSET(module->internalSocket, readset);
 	fd_write = FD_ISSET(module->internalSocket, writeset);
+
+	ILibRemoteLogging_printf(ILibChainGetLogger(module->Chain), ILibRemoteLogging_Modules_Microstack_AsyncSocket, ILibRemoteLogging_Flags_VerbosityLevel_5, "AsyncSocket[%p] entered PostSelect", (void*)module);
+
 
 #ifndef MICROSTACK_NOTLS
 	if (module->SSLForceRead) { fd_read = 1; module->SSLForceRead = 0; } // If the previous loop filled the read buffer, force more reading.
@@ -1477,7 +1581,7 @@ void ILibAsyncSocket_PostSelect(void* socketModule, int slct, fd_set *readset, f
 				if (module->ssl_ctx != NULL)
 				{
 					// Make this call to setup the SSL stuff
-					ILibAsyncSocket_SetSSLContext(module, module->ssl_ctx, 0);
+					ILibAsyncSocket_SetSSLContext(module, module->ssl_ctx, ILibAsyncSocket_TLS_Mode_Client);
 
 					// If this is an SSL socket, launch the SSL connection process
 					if ((serr = SSL_connect(module->ssl)) != 1 && SSL_get_error(module->ssl, serr) != SSL_ERROR_WANT_READ)
@@ -1505,6 +1609,7 @@ void ILibAsyncSocket_PostSelect(void* socketModule, int slct, fd_set *readset, f
 				// Someone resumed a paused connection, but the FD_SET was not triggered because there is no new data on the socket.
 				triggerResume = 1;
 				++module->PAUSE;
+				ILibRemoteLogging_printf(ILibChainGetLogger(module->Chain), ILibRemoteLogging_Modules_Microstack_AsyncSocket, ILibRemoteLogging_Flags_VerbosityLevel_2, "AsyncSocket[%p] was RESUMED with no new data on socket", (void*)module);
 			}
 
 			// Unlock before fireing the event
@@ -1538,11 +1643,11 @@ void ILibAsyncSocket_PostSelect(void* socketModule, int slct, fd_set *readset, f
 			#endif
 			if (module->PendingSend_Head->remoteAddress.sin6_family == 0)
 			{
-				bytesSent = send(module->internalSocket, module->PendingSend_Head->buffer + module->PendingSend_Head->bytesSent, module->PendingSend_Head->bufferSize - module->PendingSend_Head->bytesSent, MSG_NOSIGNAL);
+				bytesSent = send(module->internalSocket, module->PendingSend_Head->buffer + module->PendingSend_Head->bytesSent, module->PendingSend_Head->bufferSize - module->PendingSend_Head->bytesSent, MSG_NOSIGNAL); // Klocwork reports that this could block while holding a lock... This socket has been set to O_NONBLOCK, so that will never happen
 			}
 			else
 			{
-				bytesSent = sendto(module->internalSocket, module->PendingSend_Head->buffer + module->PendingSend_Head->bytesSent, module->PendingSend_Head->bufferSize - module->PendingSend_Head->bytesSent, MSG_NOSIGNAL, (struct sockaddr*)&module->PendingSend_Head->remoteAddress, INET_SOCKADDR_LENGTH(module->PendingSend_Head->remoteAddress.sin6_family));
+				bytesSent = sendto(module->internalSocket, module->PendingSend_Head->buffer + module->PendingSend_Head->bytesSent, module->PendingSend_Head->bufferSize - module->PendingSend_Head->bytesSent, MSG_NOSIGNAL, (struct sockaddr*)&module->PendingSend_Head->remoteAddress, INET_SOCKADDR_LENGTH(module->PendingSend_Head->remoteAddress.sin6_family)); // Klocwork reports that this could block while holding a lock... This socket has been set to O_NONBLOCK, so that will never happen
 			}
 
 			if (bytesSent > 0)
@@ -1617,6 +1722,8 @@ void ILibAsyncSocket_PostSelect(void* socketModule, int slct, fd_set *readset, f
 		SEM_TRACK(AsyncSocket_TrackUnLock("ILibAsyncSocket_PostSelect", 2, module);)
 		sem_post(&(module->SendLock));
 	}
+
+	ILibRemoteLogging_printf(ILibChainGetLogger(module->Chain), ILibRemoteLogging_Modules_Microstack_AsyncSocket, ILibRemoteLogging_Flags_VerbosityLevel_5, "...AsyncSocket[%p] exited PostSelect", (void*)module);
 }
 
 /*! \fn ILibAsyncSocket_IsFree(ILibAsyncSocket_SocketModule socketModule)
@@ -1697,7 +1804,7 @@ void ILibAsyncSocket_ModuleOnConnect(ILibAsyncSocket_SocketModule socketModule)
 // <param name="socketModule">The ILibAsyncSocket to modify</param>
 // <param name="ssl_ctx">The ssl_ctx structure</param>
 #ifndef MICROSTACK_NOTLS
-void ILibAsyncSocket_SetSSLContext(ILibAsyncSocket_SocketModule socketModule, SSL_CTX *ssl_ctx, int server)
+void ILibAsyncSocket_SetSSLContext(ILibAsyncSocket_SocketModule socketModule, SSL_CTX *ssl_ctx, ILibAsyncSocket_TLS_Mode server)
 {
 	if (socketModule != NULL)
 	{
@@ -1713,6 +1820,9 @@ void ILibAsyncSocket_SetSSLContext(ILibAsyncSocket_SocketModule socketModule, SS
 		// If a socket is ready, setup SSL right now (otherwise, we will do this upon connection).
 		if (module->internalSocket != 0 && module->internalSocket != ~0 && module->ssl == NULL)
 		{
+#ifdef MICROSTACK_TLS_DETECT
+			module->TLSChecked = server == ILibAsyncSocket_TLS_Mode_Server_with_TLSDetectLogic ? 0 : 1;
+#endif
 			module->ssl = SSL_new(ssl_ctx);
 			module->sslstate = 0;
 			module->sslbio = BIO_new_socket((int)(module->internalSocket), BIO_NOCLOSE);	// This is an odd conversion from SOCKET (possible 64bit) to 32 bit integer, but has to be done.
@@ -1779,6 +1889,8 @@ void ILibAsyncSocket_UseThisSocket(ILibAsyncSocket_SocketModule socketModule, in
 	module->SSLConnect = 0;
 	#endif
 
+	ILibRemoteLogging_printf(ILibChainGetLogger(module->Chain), ILibRemoteLogging_Modules_Microstack_AsyncSocket, ILibRemoteLogging_Flags_VerbosityLevel_1, "AsyncSocket[%p] Initialized", (void*)module);
+
 	//
 	// If the buffer is too small/big, we need to realloc it to the minimum specified size
 	//
@@ -1794,6 +1906,9 @@ void ILibAsyncSocket_UseThisSocket(ILibAsyncSocket_SocketModule socketModule, in
 	#ifndef MICROSTACK_NOTLS
 	if (module->ssl_ctx != NULL)
 	{
+#ifdef MICROSTACK_TLS_DETECT
+		module->TLSChecked = 0;
+#endif
 		module->ssl = SSL_new(module->ssl_ctx);
 		module->sslstate = 0;
 		module->sslbio = BIO_new_socket((int)(module->internalSocket), BIO_NOCLOSE);	// This is an odd conversion from SOCKET (possible 64bit) to 32 bit integer, but has to be done.
@@ -1886,8 +2001,11 @@ Sessions can be paused, such that further data is not read from the socket until
 void ILibAsyncSocket_Resume(ILibAsyncSocket_SocketModule socketModule)
 {
 	struct ILibAsyncSocketModule *sm = (struct ILibAsyncSocketModule*)socketModule;
-	if (sm != NULL && sm->PAUSE > 0)
+	if (sm == NULL) { return; }
+	ILibRemoteLogging_printf(ILibChainGetLogger(sm->Chain), ILibRemoteLogging_Modules_Microstack_AsyncSocket, ILibRemoteLogging_Flags_VerbosityLevel_2, "AsyncSocket[%p] was RESUMED", (void*)socketModule);
+	if (sm->PAUSE > 0)
 	{
+		ILibRemoteLogging_printf(ILibChainGetLogger(sm->Chain), ILibRemoteLogging_Modules_Microstack_AsyncSocket, ILibRemoteLogging_Flags_VerbosityLevel_2, "...Unblocking Chain");
 		sm->PAUSE = -1;
 		ILibForceUnBlockChain(sm->Chain);
 	}

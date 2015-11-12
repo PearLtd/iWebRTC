@@ -36,6 +36,9 @@
     <ClInclude Include="Microstack\ILibParsers.h">
       <Filter>Microstack</Filter>
     </ClInclude>
+    <ClInclude Include="Microstack\ILibWebClient.h">
+      <Filter>Microstack</Filter>
+    </ClInclude>
     <ClInclude Include="core\utils.h">
       <Filter>core</Filter>
     </ClInclude>
@@ -60,6 +63,9 @@
       <Filter>Microstack</Filter>
     </ClCompile>
     <ClCompile Include="Microstack\ILibParsers.c">
+      <Filter>Microstack</Filter>
+    </ClCompile>
+    <ClCompile Include="Microstack\ILibWebServer.c">
       <Filter>Microstack</Filter>
     </ClCompile>
     <ClCompile Include="core\utils.c">

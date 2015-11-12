@@ -60,6 +60,9 @@ struct ILibAsyncServerSocketModule
 	int Tag2;
 	#ifndef MICROSTACK_NOTLS
 	SSL_CTX *ssl_ctx;
+#ifdef MICROSTACK_TLS_DETECT
+	int TLSDetectEnabled;
+#endif
 	#endif
 };
 struct ILibAsyncServerSocket_Data
@@ -251,7 +254,7 @@ void ILibAsyncServerSocket_PostSelect(void* socketModule, int slct, fd_set *read
 			if (ILibAsyncSocket_IsFree(module->AsyncSockets[i]) != 0)
 			{
 				addrlen = sizeof(addr);
-				NewSocket = accept(module->ListenSocket, (struct sockaddr*)&addr, &addrlen);
+				NewSocket = accept(module->ListenSocket, (struct sockaddr*)&addr, &addrlen); // Klocwork claims we could lose the resource acquired fom the declaration, but that is not possible in this case
 				//printf("Accept NewSocket=%d\r\n", NewSocket);
 
 				// This code rejects connections that are from out-of-scope addresses (Outside the subnet, outside local host...)
@@ -312,7 +315,11 @@ void ILibAsyncServerSocket_PostSelect(void* socketModule, int slct, fd_set *read
 					if (module->ssl_ctx != NULL)
 					{
 						// Accept a new TLS connection
-						ILibAsyncSocket_SetSSLContext(module->AsyncSockets[i], module->ssl_ctx, 1);
+#ifdef MICROSTACK_TLS_DETECT
+						ILibAsyncSocket_SetSSLContext(module->AsyncSockets[i], module->ssl_ctx, module->TLSDetectEnabled == 0 ? ILibAsyncSocket_TLS_Mode_Server : ILibAsyncSocket_TLS_Mode_Server_with_TLSDetectLogic);
+#else
+						ILibAsyncSocket_SetSSLContext(module->AsyncSockets[i], module->ssl_ctx, ILibAsyncSocket_TLS_Mode_Server);
+#endif
 					}
 					else
 					#endif	
@@ -326,7 +333,7 @@ void ILibAsyncServerSocket_PostSelect(void* socketModule, int slct, fd_set *read
 			}
 		}
 	}
-}
+} // Klocwork claims that we could lose the resource acquired in the declaration, but that is not possible in this case
 //
 // Chain Destroy handler
 //
@@ -444,12 +451,19 @@ void ILibAsyncServerSocket_OnBufferReAllocated(ILibAsyncSocket_SocketModule Conn
 }
 
 #ifndef MICROSTACK_NOTLS
+#ifdef MICROSTACK_TLS_DETECT
+void ILibAsyncServerSocket_SetSSL_CTX(ILibAsyncServerSocket_ServerModule ILibAsyncSocketModule, void *ssl_ctx, int enableTLSDetect)
+#else
 void ILibAsyncServerSocket_SetSSL_CTX(ILibAsyncServerSocket_ServerModule ILibAsyncSocketModule, void *ssl_ctx)
+#endif
 {
 	if (ILibAsyncSocketModule != NULL && ssl_ctx != NULL)
 	{
 		struct ILibAsyncServerSocketModule *module = (struct ILibAsyncServerSocketModule*)ILibAsyncSocketModule;
 		module->ssl_ctx = (SSL_CTX *)ssl_ctx;
+#ifdef MICROSTACK_TLS_DETECT
+		module->TLSDetectEnabled = enableTLSDetect;
+#endif
 	}
 }
 #endif

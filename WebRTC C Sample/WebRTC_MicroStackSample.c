@@ -32,6 +32,8 @@ limitations under the License.
 #include "Microstack/ILibWebRTC.h"
 #include "core/utils.h"
 #include "Microstack/ILibWrapperWebRTC.h"
+#include "Microstack/ILibNamedPipe.h"
+#include "Microstack/ILibProcessPipe.h"
 #include "SimpleRendezvousServer.h"
 
 #if defined(WIN32) && !defined(snprintf) && _MSC_VER < 1900
@@ -40,14 +42,23 @@ limitations under the License.
 
 char *htmlBody, *passiveHtmlBody, *wshtmlbody;
 int htmlBodyLength, passiveHtmlBodyLength, wshtmlBodyLength;
+int StopData = 0;
 
 ILibWrapper_WebRTC_ConnectionFactory mConnectionFactory;
 ILibWrapper_WebRTC_Connection mConnection;
 ILibWrapper_WebRTC_DataChannel *mDataChannel = NULL;
 SimpleRendezvousServer mServer;
+
 void* chain;
 char *stunServerList[] = { "stun.ekiga.net", "stun.ideasip.com", "stun.schlund.de", "stunserver.org", "stun.softjoys.com", "stun.voiparound.com", "stun.voipbuster.com", "stun.voipstunt.com", "stun.voxgratia.org" };
 int useStun = 0;
+
+ILibProcessPipe_Manager pipeManager2;
+ILibNamedPipe_Manager pipeManager;
+ILibNamedPipe_Module_Server pipeServer;
+ILibNamedPipe_Module_Client c;
+
+char TestWrite[1024];
 
 // This is called when Data is received on the WebRTC Data Channel
 void OnDataChannelData(ILibWrapper_WebRTC_DataChannel *dataChannel, char* buffer, int bufferLen)
@@ -56,12 +67,19 @@ void OnDataChannelData(ILibWrapper_WebRTC_DataChannel *dataChannel, char* buffer
 	printf("Received data on [%s]: %s\r\n", dataChannel->channelName, buffer);
 }
 
+// This is called when the Data Channel was closed
+void OnDataChannelClosed(ILibWrapper_WebRTC_DataChannel *dataChannel)
+{
+	printf("DataChannel [%s]:%u was closed\r\n", dataChannel->channelName, dataChannel->streamId);
+}
+
 // This is called when the remote ACK's our DataChannel creation request
 void OnDataChannelAck(ILibWrapper_WebRTC_DataChannel *dataChannel)
 {
 	mDataChannel = dataChannel;
-	printf("DataChannel was successfully ACK'ed\r\n");
+	printf("DataChannel [%s] was successfully ACK'ed\r\n", dataChannel->channelName);
 	mDataChannel->OnStringData = (ILibWrapper_WebRTC_DataChannel_OnData)&OnDataChannelData;
+	mDataChannel->OnClosed = (ILibWrapper_WebRTC_DataChannel_OnClosed)&OnDataChannelClosed;
 }
 
 // This is called when a WebRTC Connection is established or disconnected
@@ -69,7 +87,7 @@ void WebRTCConnectionSink(ILibWrapper_WebRTC_Connection connection, int connecte
 {
 	if(connected)
 	{
-		printf("WebRTC connection Established.\r\n");
+		printf("WebRTC connection Established. [%s]\r\n", ILibWrapper_WebRTC_Connection_DoesPeerSupportUnreliableMode(connection)==0?"RELIABLE Only":"UNRELIABLE Supported");
 		ILibWrapper_WebRTC_DataChannel_Create(connection, "MyDataChannel", 13, &OnDataChannelAck);
 	}
 	else
@@ -83,9 +101,10 @@ void WebRTCConnectionSink(ILibWrapper_WebRTC_Connection connection, int connecte
 // This is called when the remote side created a data channel
 void WebRTCDataChannelSink(ILibWrapper_WebRTC_Connection connection, ILibWrapper_WebRTC_DataChannel *dataChannel)
 {
-	printf("WebRTC Data Channel (%s) was created.\r\n", dataChannel->channelName);
+	printf("WebRTC Data Channel (%u:%s) was created.\r\n", dataChannel->streamId, dataChannel->channelName);
 	mDataChannel = dataChannel;
 	mDataChannel->OnStringData = (ILibWrapper_WebRTC_DataChannel_OnData)&OnDataChannelData;
+	mDataChannel->OnClosed = (ILibWrapper_WebRTC_DataChannel_OnClosed)&OnDataChannelClosed;
 }
 
 void WebRTCConnectionSendOkSink(ILibWrapper_WebRTC_Connection connection)
@@ -119,19 +138,18 @@ void PassiveCandidateSink(ILibWrapper_WebRTC_Connection connection, struct socka
 	char *offer;
 	char *encodedOffer;
 	int encodedOfferLen;
-	char *h1, *h2;
+	char *h1;
 
 	ILibWrapper_WebRTC_Connection_GetUserData(connection, &sender, &token, (void**)&h1);
 
 	offer = ILibWrapper_WebRTC_Connection_AddServerReflexiveCandidateToLocalSDP(connection, candidate);
 	encodedOfferLen = ILibBase64Encode((unsigned char*)offer, strlen(offer),(unsigned char**)&encodedOffer);
 
-	h2 = ILibString_Replace(h1, strlen(h1), "/*{{{SDP}}}*/", 13, encodedOffer, encodedOfferLen);
+	h1 = ILibString_Replace(passiveHtmlBody, passiveHtmlBodyLength, "/*{{{SDP}}}*/", 13, encodedOffer, encodedOfferLen);
 
-	free(h1);
 	free(offer);
 	free(encodedOffer);
-	SimpleRendezvousServer_Respond(sender, token, 1, h2, strlen(h2), ILibAsyncSocket_MemoryOwnership_CHAIN); // Send the SDP to the remote side
+	SimpleRendezvousServer_Respond(sender, token, 1, h1, strlen(h1), ILibAsyncSocket_MemoryOwnership_CHAIN); // Send the SDP to the remote side
 }
 
 void OnWebSocket(SimpleRendezvousServerToken sender, int InterruptFlag, struct packetheader *header, char *bodyBuffer, int bodyBufferLen, SimpleRendezvousServer_WebSocket_DataTypes bodyBufferType, SimpleRendezvousServer_DoneFlag done)
@@ -175,22 +193,25 @@ void OnWebSocketClosed(SimpleRendezvousServerToken sender)
 // This gets called When the browser hits one of the two URLs
 void Rendezvous_OnGet(SimpleRendezvousServer sender, SimpleRendezvousServerToken token, char* path, char* receiver)
 {
-	char temp[255];
-	int tempLen;
-
-	tempLen = snprintf(temp, 255, "%s:5350", receiver);
-
 	if(strcmp(path, "/active")==0)
 	{
-		char* html;
 		if(mConnection != NULL) { ILibWrapper_WebRTC_Connection_Disconnect(mConnection); mConnection = NULL; }
 
-		html = ILibString_Replace(htmlBody, htmlBodyLength, "{{{OFFER_URL}}}", 15, temp, tempLen);
-		SimpleRendezvousServer_Respond(sender, token, 1, html, strlen(html), ILibAsyncSocket_MemoryOwnership_CHAIN);  // Send the HTML to the Browser
+#ifdef MICROSTACK_TLS_DETECT
+		if(SimpleRendezvousServer_IsTLS(token)!=0)
+		{
+			printf(" Received Client Request: [TLS]\r\n");
+		}
+		else
+		{
+			printf(" Received Client Request: [No-TLS]\r\n");
+		}
+#endif
+
+		SimpleRendezvousServer_Respond(sender, token, 1, htmlBody, htmlBodyLength, ILibAsyncSocket_MemoryOwnership_USER);  // Send the HTML to the Browser
 	}
 	else if(strcmp(path, "/websocket")==0)
 	{
-		char *wshtml;
 		int v = SimpleRendezvousServer_WebSocket_IsRequest(token);
 
 		if(SimpleRendezvousServer_IsAuthenticated(token, "www.meshcentral.com", 19)!=0)
@@ -198,8 +219,7 @@ void Rendezvous_OnGet(SimpleRendezvousServer sender, SimpleRendezvousServerToken
 			char* name = SimpleRendezvousServer_GetUsername(token);
 			if(SimpleRendezvousServer_ValidatePassword(token, "bryan", 5)!=0)
 			{
-				wshtml = ILibString_Replace(wshtmlbody, wshtmlBodyLength, "{{{WEBSOCKET_URL}}}", 19, temp, tempLen);
-				SimpleRendezvousServer_Respond(sender, token, 1, wshtml, strlen(wshtml), ILibAsyncSocket_MemoryOwnership_CHAIN);  // Send the HTML to the Browser
+				SimpleRendezvousServer_Respond(sender, token, 1, wshtmlbody, wshtmlBodyLength, ILibAsyncSocket_MemoryOwnership_USER);  // Send the HTML to the Browser
 			}
 		}
 	}
@@ -213,7 +233,7 @@ void Rendezvous_OnGet(SimpleRendezvousServer sender, SimpleRendezvousServerToken
 		char* offer;
 		char* encodedOffer = NULL;
 		int encodedOfferLen;
-		char *h1,*h2;
+		char *h1;
 		
 		if(mConnection != NULL){ ILibWrapper_WebRTC_Connection_Disconnect(mConnection); mConnection = NULL; }
 
@@ -229,16 +249,13 @@ void Rendezvous_OnGet(SimpleRendezvousServer sender, SimpleRendezvousServerToken
 			offer = ILibWrapper_WebRTC_Connection_GenerateOffer(mConnection, NULL);
 			printf("Encoding Offer...\r\n");
 			encodedOfferLen = ILibBase64Encode((unsigned char*)offer, strlen(offer),(unsigned char**)&encodedOffer);
-
-			h1  = ILibString_Replace(passiveHtmlBody, passiveHtmlBodyLength, "{{{OFFER_URL}}}", 15, temp, tempLen);
-			h2 = ILibString_Replace(h1, strlen(h1), "/*{{{SDP}}}*/", 13, encodedOffer, encodedOfferLen);
+			h1 = ILibString_Replace(passiveHtmlBody, passiveHtmlBodyLength, "/*{{{SDP}}}*/", 13, encodedOffer, encodedOfferLen);
 
 			printf("Sending Offer...\r\n");
 
-			free(h1);
 			free(offer);
 			free(encodedOffer);
-			SimpleRendezvousServer_Respond(sender, token, 1, h2, strlen(h2), ILibAsyncSocket_MemoryOwnership_CHAIN); // Send the HTML/OFFER to the browser
+			SimpleRendezvousServer_Respond(sender, token, 1, h1, strlen(h1), ILibAsyncSocket_MemoryOwnership_CHAIN); // Send the HTML/OFFER to the browser
 		}
 		else
 		{
@@ -246,8 +263,7 @@ void Rendezvous_OnGet(SimpleRendezvousServer sender, SimpleRendezvousServerToken
 			// If STUN was enabled, to simplify this sample app, we'll generate the offer, but we won't do anything with it, as we'll wait until
 			// we get called back saying that candidate gathering was done
 			//
-			h1  = ILibString_Replace(passiveHtmlBody, passiveHtmlBodyLength, "{{{OFFER_URL}}}", 15, temp, tempLen);
-			ILibWrapper_WebRTC_Connection_SetUserData(mConnection, sender, token, h1);
+			ILibWrapper_WebRTC_Connection_SetUserData(mConnection, sender, token, NULL);
 			free(ILibWrapper_WebRTC_Connection_GenerateOffer(mConnection, &PassiveCandidateSink));
 			// We're immediately freeing, becuase we're going to re-generate the offer when we get the candidate callback
 			// It would be better if we sent this offer, and just passed along the candidates separately, but that is for another sample, since that requires more complex logic.
@@ -320,27 +336,126 @@ void BreakSink(int s)
 	ILibStopChain(chain); // Shutdown the Chain
 }
 #endif
+
+unsigned int totalWritten = 0;
+unsigned int totalRead = 0;
+ILibProcessPipe_Process pr;
+
+void WriteData()
+{
+	//memset(TestWrite, "F", sizeof(TestWrite));
+	//do
+	//{
+	//	totalWritten += sizeof(TestWrite);
+	//} while (ILibNamedPipe_Write(c, TestWrite, sizeof(TestWrite), ILibTransport_MemoryOwnership_USER) == ILibTransport_DoneState_COMPLETE);
+
+	printf("Written %u bytes so far...\r\n", totalWritten);
+}
+
+void OnClientPipeDisconnect(ILibNamedPipe_Manager sender, ILibNamedPipe_Module_Client clientPipeModule, void *user)
+{
+	totalRead = 0;
+	printf("Pipe Closed!\r\n");
+}
+void OnClientRead(ILibNamedPipe_Module_Client pipeModule, char* buffer, int offset, int bytesRead, int *bytesConsumed, void *user)
+{
+	totalRead += bytesRead;
+	*bytesConsumed = bytesRead;
+	printf("%u bytes read so far...\r\n", totalRead);
+}
+void OnClientSendOk(ILibNamedPipe_Module_Client pipeModule, void* user)
+{
+	//WriteData();
+}
+
+void TestCallback(void *object)
+{
+	printf("callback\r\n");
+}
+
+void StdOutHandler(ILibProcessPipe_Process sender, char *buffer, int bufferLen, int* bytesConsumed, void* user)
+{
+	buffer[bufferLen] = 0;
+	printf("%s", buffer);
+	*bytesConsumed = bufferLen;
+}
+void exitSink(ILibProcessPipe_Process sender, int exitCode, void* user)
+{
+	printf("\r\n\r\nChild process exited with code: %d\r\n", exitCode);
+}
 void Run()
 {
-	char temp[1024];
+	char temp[100];
 	char* line;
+	ILibTransport_DoneState ds;
+	
+	
+	line = fgets(temp, 100, stdin);
+	if (line != NULL && strlen(line)>5 && strncasecmp(line, "spawn", 5) == 0)
+	{
+		printf("Testing Spawn\r\n");
+#ifdef WIN32
+		pr = ILibProcessPipe_Manager_SpawnProcess(pipeManager2, "C:\\windows\\system32\\cmd.exe", NULL);
+#else
+		pr = ILibProcessPipe_Manager_SpawnProcess(pipeManager2, "/bin/sh", (char*[]){"sh", NULL});
+#endif
+		ILibProcessPipe_Process_AddHandlers(pr, &exitSink, &StdOutHandler, NULL, NULL, NULL);
+		Run();
+	}
+	else if (line != NULL && strlen(line) > 5 && strncasecmp(line, "write", 5) == 0)
+	{
+		printf("Writing commands\r\n");
+#ifdef WIN32
+		ILibProcessPipe_Process_WriteStdIn(pr, "ipconfig\r\n", 10, ILibTransport_MemoryOwnership_STATIC);
+#else
+		ILibProcessPipe_Process_WriteStdIn(pr, "ls -l\n", 6, ILibTransport_MemoryOwnership_STATIC);
+#endif
+		Run();
+	}
+	else if (line != NULL && strlen(line) > 4 && strncasecmp(line, "exit", 4) == 0)
+	{
+		printf("Writing commands\r\n");
+		ILibProcessPipe_Process_WriteStdIn(pr, "exit /b 0\r\n", 11, ILibTransport_MemoryOwnership_STATIC);
+		Run();
+	}
 
 	while(ILibIsChainBeingDestroyed(chain)==0)
 	{
-		line = fgets(temp, 1024, stdin);
-
-		if (mDataChannel != NULL && line!=NULL)
+		line = fgets(temp, 100, stdin);
+		if (line != NULL && strlen(line)>4 && strncasecmp(line, "stop", 4) == 0)
 		{
-			ILibWrapper_WebRTC_DataChannel_SendString(mDataChannel, line, strlen(line)); // Send string data over the WebRTC Data Channel
+			printf("\r\nStopping Data Transfer\r\n");
+			StopData = 1;
+		}
+		else if (line != NULL && strlen(line)>5 && strncasecmp(line, "start", 5) == 0)
+		{
+			if (c == NULL)
+			{
+				printf("\r\nNo PIPE CONNECTION!\r\n");
+			}
+			else
+			{
+				printf("\r\nStarting Data Transfer\r\n");
+				StopData = 0; 
+				WriteData();
+			}
 		}
 	}
 }
+
+
 #if defined(WIN32)
 int _tmain(int argc, _TCHAR* argv[])
 #else
 int main(int argc, char **argv)
 #endif
 {
+	/* This is to test TLS and TLS Detect
+	struct util_cert selfcert;
+	struct util_cert selftlscert;
+	SSL_CTX* ctx;
+	*/
+
 #if defined(WIN32)
 	_CrtSetDbgFlag ( _CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF );
 	SetConsoleCtrlHandler((PHANDLER_ROUTINE)CtrlHandler, TRUE); // Set SIGNAL on windows to listen for Ctrl-C
@@ -378,12 +493,44 @@ int main(int argc, char **argv)
 
 	printf("Microstack WebRTC Sample Application started.\r\n\r\n");
 
+	//pipeManager = ILibNamedPipe_CreateManager(chain);
+	pipeManager2 = ILibProcessPipe_Manager_Create(chain);
+
 	// We're actually listening on all interfaces, not just 127.0.0.1
 	printf("Browser-initiated connection: http://127.0.0.1:5350/active\r\n");	// This will cause the browser to initiate a WebRTC Connection
-	printf("Application-initiated connection: http://127.0.0.1:5350/passive\r\n\r\n(Press Ctrl-C to exit)\r\n"); // This will initiate a WebRTC Connection to the browser
-	
+	printf("Application-initiated connection: http://127.0.0.1:5350/passive\r\n"); // This will initiate a WebRTC Connection to the browser
+	printf("Web-Socket initiated connection: http://127.0.0.1:5350/websocket\r\n"); // This will cause the browser to initiate a websocket connection to exchange WebRTC offers.
+	printf("\r\n");
+#if defined(_REMOTELOGGING) && defined(_REMOTELOGGINGSERVER)
+	printf("Debug logging listening url: http://127.0.0.1:%u\r\n", ILibStartDefaultLogger(chain, 0));
+#endif
+	printf("\r\n(Press Ctrl-C to exit)\r\n");
+	/* This is to test TLS and TLS Detect
+	// Init Certs
+	util_mkCert(NULL, &selfcert, 2048, 10000, "localhost", CERTIFICATE_ROOT, NULL);
+	util_mkCert(&selfcert, &selftlscert, 2048, 10000, "10.0.0.240", CERTIFICATE_TLS_SERVER, NULL);
+	// Init TLS
+	ctx = SSL_CTX_new(TLSv1_method());
+	SSL_CTX_use_certificate(ctx, selftlscert.x509);
+	SSL_CTX_use_PrivateKey(ctx, selftlscert.pkey);
+	SimpleRendezvousServer_SetSSL(mServer, ctx);
+	*/
+
+	;
+
 	ILibSpawnNormalThread(&Run, NULL); // Spawn a thread to listen for user input
+
+	
+
 	ILibStartChain(chain); // This will start the Microstack Chain... It will block until ILibStopChain is called
+	
+
+	/* This is to test TLS and TLS Detect
+	SSL_CTX_free(ctx);
+	util_freecert(&selfcert);
+	util_freecert(&selftlscert);
+	*/
+
 
 	// This won't execute until the Chain was stopped
 	free(htmlBody);

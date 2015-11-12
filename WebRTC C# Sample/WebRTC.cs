@@ -560,6 +560,46 @@ namespace OpenSource.WebRTC
     /// </summary>
     public class WebRTCConnection : IDisposable
     {
+        private static bool mForce = false;
+        public static bool ChainAlwaysRunning
+        {
+            get
+            {
+                return (mForce);
+            }
+            set
+            {
+                mForce = value;
+                if (Chain == null && value)
+                {
+                    Chain = new WebRTCCommons.MicrostackChain();
+                    nConnectionFactory = ILibWrapper_DLL_WebRTC_ConnectionFactory_CreateConnectionFactory(Chain.mChain, 0);
+                    Chain.StartChain();
+                }
+                if (!value)
+                {
+                    lock (Connections)
+                    {
+                        if (Connections.Count == 0)
+                        {
+                            Chain.Dispose();
+                            Chain = null;
+                        }
+                    }
+                }
+            }
+        }
+        public static ushort StartDefaultLogger(ushort port)
+        {
+            if (nConnectionFactory != IntPtr.Zero)
+            {
+                return (ILibWrapper_DLL_WebRTC_StartDefaultLogger(nConnectionFactory, port));
+            }
+            else
+            {
+                return (0);
+            }
+        }
         private bool mConnected = false;
         private static WebRTCCommons.MicrostackChain Chain = null;
         private static IntPtr nConnectionFactory;
@@ -582,6 +622,10 @@ namespace OpenSource.WebRTC
 
         [DllImport("WebRTC.dll", CharSet = CharSet.Auto, CallingConvention = CallingConvention.Cdecl)]
         private static extern IntPtr ILibWrapper_DLL_WebRTC_ConnectionFactory_CreateConnection(IntPtr factory, ILibWrapper_WebRTC_Connection_OnConnect OnConnectHandler, ILibWrapper_WebRTC_Connection_OnDataChannel OnDataChannelHandler, ILibWrapper_WebRTC_Connection_OnSendOK OnConnectionSendOK);
+
+        [DllImport("WebRTC.dll", CharSet = CharSet.Auto, CallingConvention = CallingConvention.Cdecl)]
+        private static extern ushort ILibWrapper_DLL_WebRTC_StartDefaultLogger(IntPtr factory, ushort port);
+
         #endregion
         
         #endregion
@@ -590,11 +634,23 @@ namespace OpenSource.WebRTC
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi)]
         public struct NativeDataChannel
         {
-            public ushort streamId;
-            public IntPtr channelName;
+            /*
+            *
+            * DO NOT MODIFY STRUCT DEFINITION
+            *
+            */
             public ILibWrapper_WebRTC_DataChannel_OnData OnBinaryData;
             public ILibWrapper_WebRTC_DataChannel_OnData OnStringData;
             public ILibWrapper_WebRTC_DataChannel_OnRawData OnRawData;
+            public IntPtr Chain;
+            public IntPtr SendPtr;
+            public IntPtr ClosePtr;
+            public IntPtr PendingBytesPtr;
+            public UInt32 IdentifierFlags;
+
+            public ushort streamId;
+            public IntPtr channelName;
+
             public ILibWrapper_WebRTC_DataChannel_OnDataChannel OnAck;
             public ILibWrapper_WebRTC_DataChannel_OnClosed OnClosed;
             public IntPtr parent;
@@ -631,6 +687,11 @@ namespace OpenSource.WebRTC
 
         [DllImport("WebRTC.dll", CharSet = CharSet.Auto, CallingConvention = CallingConvention.Cdecl)]
         private static extern void ILibWrapper_DLL_WebRTC_Connection_Disconnect(IntPtr connection);
+
+        [DllImport("WebRTC.dll", CharSet = CharSet.Auto, CallingConvention = CallingConvention.Cdecl)]
+        private static extern void ILibWrapper_DLL_WebRTC_Connection_Pause(IntPtr connection);
+        [DllImport("WebRTC.dll", CharSet = CharSet.Auto, CallingConvention = CallingConvention.Cdecl)]
+        private static extern void ILibWrapper_DLL_WebRTC_Connection_Resume(IntPtr connection);
 
         [DllImport("WebRTC.dll", CharSet = CharSet.Auto, CallingConvention = CallingConvention.Cdecl)]
         private static extern void ILibWrapper_DLL_WebRTC_Connection_SetStunServers(IntPtr connection, [MarshalAs(UnmanagedType.LPArray, ArraySubType = UnmanagedType.LPStr)] string[] serverList, int serverLength);       
@@ -1002,12 +1063,12 @@ namespace OpenSource.WebRTC
             if (!disposing)
             {
                 disposing = true;
-                //ILibWrapper_DLL_WebRTC_Connection_Disconnect(nConnection);
+                ILibWrapper_DLL_WebRTC_Connection_Disconnect(nConnection);
 
                 lock (Connections)
                 {
                     Connections.Remove(this);
-                    if (Connections.Count == 0)
+                    if (Connections.Count == 0 && !mForce)
                     {
                         Chain.Dispose();
                         Chain = null;
@@ -1111,7 +1172,23 @@ namespace OpenSource.WebRTC
             return (WebRTCDataChannel.Create(this, channelName, streamId));
         }
 
-        
+        /// <summary>
+        /// Pauses the processing of inbound data for all DataChannels
+        /// </summary>
+        public void Pause()
+        {
+            ILibWrapper_DLL_WebRTC_Connection_Pause(nConnection);
+        }
+
+        /// <summary>
+        /// Resumes processing of inbound data for all DataChannels
+        /// </summary>
+        public void Resume()
+        {
+            ILibWrapper_DLL_WebRTC_Connection_Resume(nConnection);
+        }
+
+
     }
     #endregion
 
@@ -1199,6 +1276,8 @@ namespace OpenSource.WebRTC
         private static extern IntPtr ILibWrapper_DLL_WebRTC_DataChannel_Create(IntPtr connection, IntPtr channelName, int channelNameLen, WebRTCConnection.NativeDataChannel.ILibWrapper_WebRTC_DataChannel_OnDataChannel OnAckHandler, IntPtr user);
         [DllImport("WebRTC.dll", CharSet = CharSet.Auto, CallingConvention = CallingConvention.Cdecl)]
         private static extern IntPtr ILibWrapper_DLL_WebRTC_DataChannel_CreateEx(IntPtr connection, IntPtr channelName, int channelNameLen, ushort streamId, WebRTCConnection.NativeDataChannel.ILibWrapper_WebRTC_DataChannel_OnDataChannel OnAckHandler, IntPtr user);
+        [DllImport("WebRTC.dll", CharSet = CharSet.Auto, CallingConvention = CallingConvention.Cdecl)]
+        private static extern void ILibWrapper_DLL_WebRTC_DataChannel_Close([MarshalAs(UnmanagedType.Struct)] ref WebRTCConnection.NativeDataChannel dataChannel);        
         #endregion
 
         public readonly WebRTCConnection ParentConnection;
@@ -1306,7 +1385,10 @@ namespace OpenSource.WebRTC
 
             return (retVal);
         }
-
+        public void Close()
+        {
+            ILibWrapper_DLL_WebRTC_DataChannel_Close(ref nDataChannel);
+        }
 
         /// <summary>
         /// Send string data

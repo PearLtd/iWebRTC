@@ -97,7 +97,7 @@ limitations under the License.
                 requester = new XMLHttpRequest();
                 requester.onload = initiatorResponse;
                 requester.onerror = initiatorErrorResponse;
-                requester.open("POST", "http://{{{OFFER_URL}}}", true);
+                requester.open("POST", window.location.protocol + "//" + window.location.host, true);
                 requester.send(sdp);
                 
                 return;

@@ -35,6 +35,7 @@ extern "C"
 	#include "Microstack/ILibWebRTC.h"
 	#include "core/utils.h"
 	#include "Microstack/ILibWrapperWebRTC.h"
+	#include "Microstack/ILibWebServer.h"
 }
 
 extern "C"
@@ -282,6 +283,30 @@ extern "C"
 	// WebRTC
 	//
 
+	__declspec(dllexport) unsigned short ILibWrapper_DLL_WebRTC_StartDefaultLogger(ILibWrapper_WebRTC_ConnectionFactory factory, unsigned short port)
+	{
+#if defined(_REMOTELOGGING) && defined(_REMOTELOGGINGSERVER)
+		void *chain = ((void**)factory)[4];
+		if (ILibChainGetLogger(chain) == NULL)
+		{
+			return(ILibStartDefaultLogger(chain, port));
+		}
+		else
+		{
+			if (chain != NULL)
+			{
+				return(ILibWebServer_GetPortNumber((ILibWebServer_ServerToken)(((void**)&((int*)chain)[2])[1])));
+			}
+			else
+			{
+				return(0);
+			}
+		}
+#else
+		return(0);
+#endif
+	}
+
 	//
 	// ConnectionFactory Methods
 	//
@@ -334,6 +359,11 @@ extern "C"
 		return(retVal);
 	}
 
+	__declspec(dllexport) void ILibWrapper_DLL_WebRTC_DataChannel_Close(ILibWrapper_WebRTC_DataChannel* dataChannel)
+	{
+		ILibWrapper_WebRTC_DataChannel_Close(dataChannel);
+	}
+
 	// Creates a WebRTC Data Channel, using the specified Stream ID
 	__declspec(dllexport) ILibWrapper_WebRTC_DataChannel* ILibWrapper_DLL_WebRTC_DataChannel_CreateEx(ILibWrapper_WebRTC_Connection connection, char* channelName, int channelNameLen, unsigned short streamId, ILibWrapper_WebRTC_DataChannel_OnDataChannelAck OnAckHandler, void* userData)
 	{
@@ -373,24 +403,33 @@ extern "C"
 		return(ILibWrapper_WebRTC_Connection_AddServerReflexiveCandidateToLocalSDP(connection, candidate));
 	}
 
+	__declspec(dllexport) void ILibWrapper_DLL_WebRTC_Connection_Pause(ILibWrapper_WebRTC_Connection connection)
+	{
+		ILibWrapper_WebRTC_Connection_Pause(connection);
+	}
+	__declspec(dllexport) void ILibWrapper_DLL_WebRTC_Connection_Resume(ILibWrapper_WebRTC_Connection connection)
+	{
+		ILibWrapper_WebRTC_Connection_Resume(connection);
+	}
+
 	//
 	// WebRTC Data Channel
 	//
 
 	// Send Binary Data over the specified Data Channel
-	__declspec(dllexport) enum ILibAsyncSocket_SendStatus ILibWrapper_DLL_WebRTC_DataChannel_Send(ILibWrapper_WebRTC_DataChannel* dataChannel, char* data, int dataLen)
+	__declspec(dllexport) ILibTransport_DoneState ILibWrapper_DLL_WebRTC_DataChannel_Send(ILibWrapper_WebRTC_DataChannel* dataChannel, char* data, int dataLen)
 	{
 		return(ILibWrapper_WebRTC_DataChannel_Send(dataChannel, data, dataLen));
 	}
 
 	// Send Arbitrary Data over the specified Data Channel. (Must specify the data type)
-	__declspec(dllexport) enum ILibAsyncSocket_SendStatus ILibWrapper_DLL_WebRTC_DataChannel_SendEx(ILibWrapper_WebRTC_DataChannel* dataChannel, char* data, int dataLen, int dataType)
+	__declspec(dllexport) ILibTransport_DoneState ILibWrapper_DLL_WebRTC_DataChannel_SendEx(ILibWrapper_WebRTC_DataChannel* dataChannel, char* data, int dataLen, int dataType)
 	{
 		return(ILibWrapper_WebRTC_DataChannel_SendEx(dataChannel, data, dataLen, dataType));
 	}
 
 	// Send String Data over the specified Data Channel
-	__declspec(dllexport) enum ILibAsyncSocket_SendStatus ILibWrapper_DLL_WebRTC_DataChannel_SendString(ILibWrapper_WebRTC_DataChannel* dataChannel, char* data, int dataLen)
+	__declspec(dllexport) ILibTransport_DoneState ILibWrapper_DLL_WebRTC_DataChannel_SendString(ILibWrapper_WebRTC_DataChannel* dataChannel, char* data, int dataLen)
 	{
 		return(ILibWrapper_WebRTC_DataChannel_SendString(dataChannel, data, dataLen));
 	}

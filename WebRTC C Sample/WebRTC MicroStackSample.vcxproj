@@ -19,13 +19,13 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
     <ConfigurationType>Application</ConfigurationType>
     <UseDebugLibraries>true</UseDebugLibraries>
-    <PlatformToolset>v110</PlatformToolset>
+    <PlatformToolset>v120</PlatformToolset>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" Label="Configuration">
     <ConfigurationType>Application</ConfigurationType>
     <UseDebugLibraries>false</UseDebugLibraries>
-    <PlatformToolset>v110</PlatformToolset>
+    <PlatformToolset>v120</PlatformToolset>
     <WholeProgramOptimization>true</WholeProgramOptimization>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
@@ -51,13 +51,13 @@
       </PrecompiledHeader>
       <WarningLevel>Level3</WarningLevel>
       <Optimization>Disabled</Optimization>
-      <PreprocessorDefinitions>WIN32;_DEBUG;_CONSOLE;MICROSTACK_NO_STDAFX;WINSOCK2;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>WIN32;_DEBUG;_CONSOLE;MICROSTACK_NO_STDAFX;WINSOCK2;MICROSTACK_TLS_DETECT;_REMOTELOGGING;_REMOTELOGGINGSERVER;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalIncludeDirectories>openssl\include\openssl;openssl\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>$(ProjectDir)\openssl\libstatic\libeay32MTd.lib;$(ProjectDir)\openssl\libstatic\ssleay32MTd.lib;ws2_32.lib;Iphlpapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>$(ProjectDir)\openssl\libstatic\libeay32MT.lib;$(ProjectDir)\openssl\libstatic\ssleay32MT.lib;ws2_32.lib;Iphlpapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <PostBuildEvent>
       <Command>copy "$(ProjectDir)webrtcsample.html" "$(OutputPath)"
@@ -92,6 +92,9 @@ copy "$(ProjectDir)websocketsample.html" "$(OutputPath)"</Command>
     <Text Include="ReadMe.txt" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="..\..\..\Bryan%27s Projects\WebRTC\WebRTC C Sample\Microstack\ILibNamedPipe.h" />
+    <ClInclude Include="..\..\..\Bryan%27s Projects\WebRTC\WebRTC C Sample\Microstack\ILibProcessPipe.h" />
+    <ClInclude Include="..\..\..\Bryan%27s Projects\WebRTC\WebRTC C Sample\Microstack\ILibRemoteLogging.h" />
     <ClInclude Include="core\utils.h" />
     <ClInclude Include="Microstack\ILibAsyncServerSocket.h" />
     <ClInclude Include="Microstack\ILibAsyncSocket.h" />
@@ -106,6 +109,9 @@ copy "$(ProjectDir)websocketsample.html" "$(OutputPath)"</Command>
     <ClInclude Include="targetver.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="..\..\..\Bryan%27s Projects\WebRTC\WebRTC C Sample\Microstack\ILibNamedPipe.c" />
+    <ClCompile Include="..\..\..\Bryan%27s Projects\WebRTC\WebRTC C Sample\Microstack\ILibProcessPipe.c" />
+    <ClCompile Include="Microstack\ILibRemoteLogging.c" />
     <ClCompile Include="core\utils.c" />
     <ClCompile Include="Microstack\ILibAsyncServerSocket.c" />
     <ClCompile Include="Microstack\ILibAsyncSocket.c" />

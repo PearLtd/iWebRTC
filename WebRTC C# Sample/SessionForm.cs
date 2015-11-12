@@ -30,9 +30,17 @@ namespace WebRTC_Sample
 {
     public partial class SessionForm : Form
     {
+        public bool isConnected
+        {
+            get
+            {
+                return (mConnected);
+            }
+        }
         private WebRTCConnection mConnection;
         private WebRTCDataChannel mData;
         private bool closing = false;
+        private bool mConnected = false;
 
         private int mValue = new Random().Next(1, int.MaxValue);
         public int Value { get { return (mValue); } }
@@ -41,6 +49,8 @@ namespace WebRTC_Sample
             if (!preserveOrder) { servers.Shuffle(); }
             mConnection.SetStunServers(servers);
         }
+
+        public WebRTCConnection Connection { get { return (mConnection); } }
         public SessionForm()
         {
             InitializeComponent();
@@ -51,6 +61,7 @@ namespace WebRTC_Sample
             mConnection.OnDisconnected += mConnection_OnDisconnected;
             mConnection.OnDataChannel += mConnection_OnDataChannel;
             messageTextBox.Text += ("Got offer at " + DateTime.Now.ToShortTimeString() + ", buiding answer...\r\n");
+            this.Text += " dPort: " + WebRTCConnection.StartDefaultLogger(0).ToString();
         }
 
 
@@ -68,6 +79,7 @@ namespace WebRTC_Sample
 
         async void mConnection_OnDisconnected(WebRTCConnection sender)
         {
+            mConnected = false;
             mConnection = null;
             if (!closing)
             {
@@ -78,16 +90,18 @@ namespace WebRTC_Sample
 
         async void mConnection_OnConnected(WebRTCConnection sender)
         {
+            mConnected = true;
             await this.ContextSwitchToMessagePumpAsync(); // Switch to UI Thread so we can modify the UI
             messageTextBox.Text += ("Connected at " + DateTime.Now.ToShortTimeString() + "\r\n");
             messageTextBox.Select(messageTextBox.Text.Length, 0);
-
+            
             WebRTCDataChannel dc = await sender.CreateDataChannel("MyDataChannel"); // Wait to see if this is ACK'ed
             if (dc != null) 
             {
                 // YUP
                 mData = dc;
                 mData.OnStringReceiveData += mData_OnStringReceiveData;
+                mData.OnClosing += mData_OnClosing;
             }
 
             await this.ContextSwitchToMessagePumpAsync(); // Switch to UI thread so we can modify the UI... (The last await may have switched us to the WebRTC thread)
@@ -97,6 +111,13 @@ namespace WebRTC_Sample
             {
                 inputTextBox.Enabled = true; // Only setting if true, because there could already be a dataChannel that has already enabled the textbox
             }         
+        }
+
+        async void mData_OnClosing(WebRTCDataChannel sender)
+        {
+            await this.ContextSwitchToMessagePumpAsync(); // Switch to UI Thread so we can modify the UI
+            messageTextBox.Text += ("Data Channel (" + sender.ChannelName + ") was closed\r\n");
+            messageTextBox.Select(messageTextBox.Text.Length, 0);
         }
 
         async void mConnection_OnDataChannel(WebRTCConnection sender, WebRTCDataChannel DataChannel)
@@ -132,7 +153,22 @@ namespace WebRTC_Sample
 
         private void sendButton_Click(object sender, EventArgs e)
         {
-            mData.Send(inputTextBox.Text);
+            if (inputTextBox.Text == "*CLOSE*")
+            {
+                mData.Close();
+            }
+            else if (inputTextBox.Text == "*PAUSE*")
+            {
+                mData.ParentConnection.Pause();
+            }
+            else if (inputTextBox.Text == "*RESUME*")
+            {
+                mData.ParentConnection.Resume();
+            }
+            else
+            {
+                mData.Send(inputTextBox.Text);
+            }
             messageTextBox.Text += ("Local: " + inputTextBox.Text + "\r\n");
             inputTextBox.Text = "";
         }

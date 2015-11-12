@@ -40,6 +40,12 @@ typedef struct
 	SimpleRendezvousServer_OnPOST OnPostHandler;
 }SimpleRendezvousServerStruct;
 
+#ifdef MICROSTACK_TLS_DETECT
+int SimpleRendezvousServer_IsTLS(SimpleRendezvousServerToken token)
+{
+	return(ILibWebServer_IsUsingTLS(((struct ILibWebServer_Session*)token)));
+}
+#endif
 void OnSessionReceive(struct ILibWebServer_Session *sender, int InterruptFlag, struct packetheader *header, char *bodyBuffer, int *beginPointer, int endPointer, ILibWebServer_DoneFlag done)
 {
 	SimpleRendezvousServerStruct *server = (SimpleRendezvousServerStruct*)sender->User;
@@ -94,8 +100,21 @@ SimpleRendezvousServer SimpleRendezvousServer_Create(void* chain, int localPort,
 	retVal->OnPostHandler = PostHandler;
 
 	ILibAddToChain(chain, retVal);
+
 	return(retVal);
 }
+
+#ifndef MICROSTACK_NOTLS
+void SimpleRendezvousServer_SetSSL(SimpleRendezvousServer server, SSL_CTX* ctx)
+{
+	SimpleRendezvousServerStruct *module = (SimpleRendezvousServerStruct*)server;
+#ifdef MICROSTACK_TLS_DETECT
+	ILibWebServer_SetTLS(module->serverToken, ctx, 1);
+#else
+	ILibWebServer_SetTLS(module->serverToken, ctx);
+#endif
+}
+#endif
 
 void SimpleRendezvousServer_Respond(SimpleRendezvousServer server, SimpleRendezvousServerToken token, int success, char* htmlBody, int htmlBodyLength, enum ILibAsyncSocket_MemoryOwnership htmlBodyFlag)
 {

@@ -54,10 +54,12 @@ extern "C" {
 */
 #define MEMORYCHUNKSIZE 4096
 
+#define ILibTransports_AsyncSocket 0x40
+
 enum ILibAsyncSocket_SendStatus
 {
-	ILibAsyncSocket_ALL_DATA_SENT = 0, /*!< All of the data has already been sent */
-	ILibAsyncSocket_NOT_ALL_DATA_SENT_YET = 1, /*!< Not all of the data could be sent, but is queued to be sent as soon as possible */
+	ILibAsyncSocket_ALL_DATA_SENT = 1, /*!< All of the data has already been sent */
+	ILibAsyncSocket_NOT_ALL_DATA_SENT_YET = 0, /*!< Not all of the data could be sent, but is queued to be sent as soon as possible */
 	ILibAsyncSocket_SEND_ON_CLOSED_SOCKET_ERROR	= -4 /*!< A send operation was attmepted on a closed socket */
 };
 
@@ -134,6 +136,11 @@ typedef void(*ILibAsyncSocket_OnSendOK)(ILibAsyncSocket_SocketModule socketModul
 */
 typedef void(*ILibAsyncSocket_OnBufferReAllocated)(ILibAsyncSocket_SocketModule AsyncSocketToken, void *user, ptrdiff_t newOffset);
 
+#ifndef MICROSTACK_NOTLS
+#ifdef MICROSTACK_TLS_DETECT
+int ILibAsyncSocket_IsUsingTls(ILibAsyncSocket_SocketModule AsyncSocketToken);
+#endif
+#endif
 
 void ILibAsyncSocket_SetReAllocateNotificationCallback(ILibAsyncSocket_SocketModule AsyncSocketToken, ILibAsyncSocket_OnBufferReAllocated Callback);
 void *ILibAsyncSocket_GetUser(ILibAsyncSocket_SocketModule socketModule);
@@ -178,7 +185,17 @@ void ILibAsyncSocket_UseThisSocket(ILibAsyncSocket_SocketModule socketModule, in
 #endif
 
 #ifndef MICROSTACK_NOTLS
-void ILibAsyncSocket_SetSSLContext(ILibAsyncSocket_SocketModule socketModule, SSL_CTX *ssl_ctx, int server);
+
+typedef enum
+{
+	ILibAsyncSocket_TLS_Mode_Client = 0,
+	ILibAsyncSocket_TLS_Mode_Server = 1,
+#ifdef MICROSTACK_TLS_DETECT
+	ILibAsyncSocket_TLS_Mode_Server_with_TLSDetectLogic = 2,
+#endif
+}ILibAsyncSocket_TLS_Mode;
+
+void ILibAsyncSocket_SetSSLContext(ILibAsyncSocket_SocketModule socketModule, SSL_CTX *ssl_ctx, ILibAsyncSocket_TLS_Mode server);
 SSL_CTX *ILibAsyncSocket_GetSSLContext(ILibAsyncSocket_SocketModule socketModule);
 #endif
 

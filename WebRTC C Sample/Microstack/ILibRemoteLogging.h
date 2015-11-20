@@ -70,6 +70,7 @@ typedef void (*ILibRemoteLogging_OnCommand)(ILibRemoteLogging sender, ILibRemote
 	#define ILibRemoteLogging_ConvertToHex(...) ;
 	#define ILibRemoteLogging_printf(...) ;
 	#define ILibRemoteLogging_Create(...) NULL;
+	#define ILibRemoteLogging_Destroy(...) ;
 	#define ILibRemoteLogging_DeleteUserContext(...) ;
 	#define ILibRemoteLogging_RegisterCommandSink(...) ;
 	#define ILibRemoteLogging_Dispatch(...) ;

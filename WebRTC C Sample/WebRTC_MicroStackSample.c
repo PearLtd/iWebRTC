@@ -32,8 +32,6 @@ limitations under the License.
 #include "Microstack/ILibWebRTC.h"
 #include "core/utils.h"
 #include "Microstack/ILibWrapperWebRTC.h"
-#include "Microstack/ILibNamedPipe.h"
-#include "Microstack/ILibProcessPipe.h"
 #include "SimpleRendezvousServer.h"
 
 #if defined(WIN32) && !defined(snprintf) && _MSC_VER < 1900
@@ -42,7 +40,6 @@ limitations under the License.
 
 char *htmlBody, *passiveHtmlBody, *wshtmlbody;
 int htmlBodyLength, passiveHtmlBodyLength, wshtmlBodyLength;
-int StopData = 0;
 
 ILibWrapper_WebRTC_ConnectionFactory mConnectionFactory;
 ILibWrapper_WebRTC_Connection mConnection;
@@ -53,12 +50,9 @@ void* chain;
 char *stunServerList[] = { "stun.ekiga.net", "stun.ideasip.com", "stun.schlund.de", "stunserver.org", "stun.softjoys.com", "stun.voiparound.com", "stun.voipbuster.com", "stun.voipstunt.com", "stun.voxgratia.org" };
 int useStun = 0;
 
-ILibProcessPipe_Manager pipeManager2;
-ILibNamedPipe_Manager pipeManager;
-ILibNamedPipe_Module_Server pipeServer;
-ILibNamedPipe_Module_Client c;
 
-char TestWrite[1024];
+
+
 
 // This is called when Data is received on the WebRTC Data Channel
 void OnDataChannelData(ILibWrapper_WebRTC_DataChannel *dataChannel, char* buffer, int bufferLen)
@@ -336,113 +330,22 @@ void BreakSink(int s)
 	ILibStopChain(chain); // Shutdown the Chain
 }
 #endif
-
-unsigned int totalWritten = 0;
-unsigned int totalRead = 0;
-ILibProcessPipe_Process pr;
-
-void WriteData()
-{
-	//memset(TestWrite, "F", sizeof(TestWrite));
-	//do
-	//{
-	//	totalWritten += sizeof(TestWrite);
-	//} while (ILibNamedPipe_Write(c, TestWrite, sizeof(TestWrite), ILibTransport_MemoryOwnership_USER) == ILibTransport_DoneState_COMPLETE);
-
-	printf("Written %u bytes so far...\r\n", totalWritten);
-}
-
-void OnClientPipeDisconnect(ILibNamedPipe_Manager sender, ILibNamedPipe_Module_Client clientPipeModule, void *user)
-{
-	totalRead = 0;
-	printf("Pipe Closed!\r\n");
-}
-void OnClientRead(ILibNamedPipe_Module_Client pipeModule, char* buffer, int offset, int bytesRead, int *bytesConsumed, void *user)
-{
-	totalRead += bytesRead;
-	*bytesConsumed = bytesRead;
-	printf("%u bytes read so far...\r\n", totalRead);
-}
-void OnClientSendOk(ILibNamedPipe_Module_Client pipeModule, void* user)
-{
-	//WriteData();
-}
-
-void TestCallback(void *object)
-{
-	printf("callback\r\n");
-}
-
-void StdOutHandler(ILibProcessPipe_Process sender, char *buffer, int bufferLen, int* bytesConsumed, void* user)
-{
-	buffer[bufferLen] = 0;
-	printf("%s", buffer);
-	*bytesConsumed = bufferLen;
-}
-void exitSink(ILibProcessPipe_Process sender, int exitCode, void* user)
-{
-	printf("\r\n\r\nChild process exited with code: %d\r\n", exitCode);
-}
 void Run()
 {
-	char temp[100];
+	char temp[1024];
 	char* line;
-	ILibTransport_DoneState ds;
-	
-	
-	line = fgets(temp, 100, stdin);
-	if (line != NULL && strlen(line)>5 && strncasecmp(line, "spawn", 5) == 0)
-	{
-		printf("Testing Spawn\r\n");
-#ifdef WIN32
-		pr = ILibProcessPipe_Manager_SpawnProcess(pipeManager2, "C:\\windows\\system32\\cmd.exe", NULL);
-#else
-		pr = ILibProcessPipe_Manager_SpawnProcess(pipeManager2, "/bin/sh", (char*[]){"sh", NULL});
-#endif
-		ILibProcessPipe_Process_AddHandlers(pr, &exitSink, &StdOutHandler, NULL, NULL, NULL);
-		Run();
-	}
-	else if (line != NULL && strlen(line) > 5 && strncasecmp(line, "write", 5) == 0)
-	{
-		printf("Writing commands\r\n");
-#ifdef WIN32
-		ILibProcessPipe_Process_WriteStdIn(pr, "ipconfig\r\n", 10, ILibTransport_MemoryOwnership_STATIC);
-#else
-		ILibProcessPipe_Process_WriteStdIn(pr, "ls -l\n", 6, ILibTransport_MemoryOwnership_STATIC);
-#endif
-		Run();
-	}
-	else if (line != NULL && strlen(line) > 4 && strncasecmp(line, "exit", 4) == 0)
-	{
-		printf("Writing commands\r\n");
-		ILibProcessPipe_Process_WriteStdIn(pr, "exit /b 0\r\n", 11, ILibTransport_MemoryOwnership_STATIC);
-		Run();
-	}
 
 	while(ILibIsChainBeingDestroyed(chain)==0)
 	{
-		line = fgets(temp, 100, stdin);
-		if (line != NULL && strlen(line)>4 && strncasecmp(line, "stop", 4) == 0)
+		line = fgets(temp, 1024, stdin);
+
+		if (mDataChannel != NULL && line!=NULL)
 		{
-			printf("\r\nStopping Data Transfer\r\n");
-			StopData = 1;
-		}
-		else if (line != NULL && strlen(line)>5 && strncasecmp(line, "start", 5) == 0)
-		{
-			if (c == NULL)
-			{
-				printf("\r\nNo PIPE CONNECTION!\r\n");
-			}
-			else
-			{
-				printf("\r\nStarting Data Transfer\r\n");
-				StopData = 0; 
-				WriteData();
-			}
+			ILibWrapper_WebRTC_DataChannel_Close(mDataChannel);
+			//ILibWrapper_WebRTC_DataChannel_SendString(mDataChannel, line, strlen(line)); // Send string data over the WebRTC Data Channel
 		}
 	}
 }
-
 
 #if defined(WIN32)
 int _tmain(int argc, _TCHAR* argv[])
@@ -493,16 +396,13 @@ int main(int argc, char **argv)
 
 	printf("Microstack WebRTC Sample Application started.\r\n\r\n");
 
-	//pipeManager = ILibNamedPipe_CreateManager(chain);
-	pipeManager2 = ILibProcessPipe_Manager_Create(chain);
-
 	// We're actually listening on all interfaces, not just 127.0.0.1
 	printf("Browser-initiated connection: http://127.0.0.1:5350/active\r\n");	// This will cause the browser to initiate a WebRTC Connection
 	printf("Application-initiated connection: http://127.0.0.1:5350/passive\r\n"); // This will initiate a WebRTC Connection to the browser
 	printf("Web-Socket initiated connection: http://127.0.0.1:5350/websocket\r\n"); // This will cause the browser to initiate a websocket connection to exchange WebRTC offers.
 	printf("\r\n");
 #if defined(_REMOTELOGGING) && defined(_REMOTELOGGINGSERVER)
-	printf("Debug logging listening url: http://127.0.0.1:%u\r\n", ILibStartDefaultLogger(chain, 0));
+	printf("Debug logging listening url: http://127.0.0.1:%u\r\n", ILibStartDefaultLogger(chain, 7775));
 #endif
 	printf("\r\n(Press Ctrl-C to exit)\r\n");
 	/* This is to test TLS and TLS Detect
@@ -519,10 +419,8 @@ int main(int argc, char **argv)
 	;
 
 	ILibSpawnNormalThread(&Run, NULL); // Spawn a thread to listen for user input
-
-	
-
 	ILibStartChain(chain); // This will start the Microstack Chain... It will block until ILibStopChain is called
+
 	
 
 	/* This is to test TLS and TLS Detect

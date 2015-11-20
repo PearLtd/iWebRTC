@@ -32,6 +32,7 @@ typedef void(*ILibProcessPipe_Process_ExitHandler)(ILibProcessPipe_Process sende
 
 ILibProcessPipe_Manager ILibProcessPipe_Manager_Create(void *chain);
 ILibProcessPipe_Process ILibProcessPipe_Manager_SpawnProcess(ILibProcessPipe_Manager pipeManager, char* target, char* parameters[]);
+int ILibProcessPipe_Process_GetPID(ILibProcessPipe_Process p);
 void ILibProcessPipe_Process_AddHandlers(ILibProcessPipe_Process module, ILibProcessPipe_Process_ExitHandler exitHandler, ILibProcessPipe_Process_OutputHandler stdOut, ILibProcessPipe_Process_OutputHandler stdErr, ILibProcessPipe_Process_SendOKHandler sendOk, void *user);
 ILibTransport_DoneState ILibProcessPipe_Process_WriteStdIn(ILibProcessPipe_Process p, char* buffer, int bufferLen, ILibTransport_MemoryOwnership ownership);
 

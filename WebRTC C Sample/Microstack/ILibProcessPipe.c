@@ -87,6 +87,7 @@ typedef void(*ILibProcessPipe_GenericBrokenPipeHandler)(ILibProcessPipe_PipeObje
 
 typedef struct ILibProcessPipe_Process_Object
 {
+	unsigned int flags1, flags2;
 	ILibProcessPipe_Manager_Object *parent;
 	unsigned long PID;
 	void *userObject;
@@ -409,7 +410,10 @@ void ILibProcessPipe_Process_BrokenPipeSink(ILibProcessPipe_PipeObject* sender)
 }
 #endif
 
-
+int ILibProcessPipe_Process_GetPID(ILibProcessPipe_Process p)
+{
+	return(p != NULL ? ((ILibProcessPipe_Process_Object*)p)->PID : 0);
+}
 ILibProcessPipe_Process ILibProcessPipe_Manager_SpawnProcess(ILibProcessPipe_Manager pipeManager, char* target, char* parameters[])
 {
 	ILibProcessPipe_Process_Object* retVal = NULL;

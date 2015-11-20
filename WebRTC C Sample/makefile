@@ -46,8 +46,8 @@ linux-32:
 	strip ./webrtc_sample_linux_x86
 
 linux-64:
-	$(MAKE) $(MAKEFILE) EXENAME="webrtc_sample_linux_x64" INCDIRS="-I. -Iopenssl/include -Imicrostack -Icore" CFLAGS="-g -O2 -Wall -D_POSIX -D_DEBUG -D_DAEMON -DMICROSTACK_PROXY -D_REMOTELOGGING -D_REMOTELOGGINGSERVER -fno-strict-aliasing $(INCDIRS)" LDFLAGS="-Lopenssl-static/x86-64 -L. -lpthread -Wl,--no-as-needed -ldl -lssl -lutil -lcrypto -lrt" 
-	#strip ./webrtc_sample_linux_x64
+	$(MAKE) $(MAKEFILE) EXENAME="webrtc_sample_linux_x64" INCDIRS="-I. -Iopenssl/include -Imicrostack -Icore" CFLAGS="-O2 -Wall -D_POSIX -D_DEBUG -D_DAEMON -DMICROSTACK_PROXY -D_REMOTELOGGING -D_REMOTELOGGINGSERVER -fno-strict-aliasing $(INCDIRS)" LDFLAGS="-Lopenssl-static/x86-64 -L. -lpthread -Wl,--no-as-needed -ldl -lssl -lutil -lcrypto -lrt" 
+	strip ./webrtc_sample_linux_x64
 
 linux-arm:
 	$(MAKE) $(MAKEFILE) EXENAME="webrtc_sample_linux_arm" CC=$(PATH_ARM5)"arm-none-linux-gnueabi-gcc" INCDIRS="-I. -Iopenssl/include -Imicrostack -Icore" CFLAGS="-O2 -Wall -D_POSIX -D_DEBUG -D_DAEMON -DMICROSTACK_PROXY -fno-strict-aliasing $(INCDIRS)" LDFLAGS="-Lopenssl-static/arm -L. -lpthread -Wl,--no-as-needed -ldl -lssl -lutil -lcrypto -lrt"

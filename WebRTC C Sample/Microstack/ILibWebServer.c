@@ -670,7 +670,7 @@ int ILibWebServer_ProcessWebSocketData(struct ILibWebServer_Session *ws, char* b
 				// Echo the Close Frame
 				ILibWebServer_WebSocket_Send(ws, buffer + i, plen > 0 ? 2 : 0, (ILibWebServer_WebSocket_DataTypes)WEBSOCKET_OPCODE_CLOSE, ILibAsyncSocket_MemoryOwnership_USER, ILibWebServer_WebSocket_FragmentFlag_Complete);
 			}
-
+			ILibRemoteLogging_printf(ILibChainGetLogger(ws->Reserved_Chain), ILibRemoteLogging_Modules_Microstack_Web, ILibRemoteLogging_Flags_VerbosityLevel_1, "ILibWebServer: << [Close OP-Code] on %p", (void*)ws);
 			ILibWebServer_DisconnectSession(ws);
 		}
 			break;

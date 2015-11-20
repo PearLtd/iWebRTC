@@ -60,9 +60,6 @@
     <ClInclude Include="..\..\..\Bryan%27s Projects\WebRTC\WebRTC C Sample\Microstack\ILibNamedPipe.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="..\..\..\Bryan%27s Projects\WebRTC\WebRTC C Sample\Microstack\ILibProcessPipe.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="stdafx.cpp">
@@ -102,12 +99,6 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="Microstack\ILibRemoteLogging.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="..\..\..\Bryan%27s Projects\WebRTC\WebRTC C Sample\Microstack\ILibNamedPipe.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="..\..\..\Bryan%27s Projects\WebRTC\WebRTC C Sample\Microstack\ILibProcessPipe.c">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>

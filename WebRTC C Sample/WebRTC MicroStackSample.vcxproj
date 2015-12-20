@@ -92,8 +92,7 @@ copy "$(ProjectDir)websocketsample.html" "$(OutputPath)"</Command>
     <Text Include="ReadMe.txt" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="..\..\..\Bryan%27s Projects\WebRTC\WebRTC C Sample\Microstack\ILibNamedPipe.h" />
-    <ClInclude Include="..\..\..\Bryan%27s Projects\WebRTC\WebRTC C Sample\Microstack\ILibRemoteLogging.h" />
+    <ClInclude Include="Microstack\ILibRemoteLogging.h" />
     <ClInclude Include="core\utils.h" />
     <ClInclude Include="Microstack\ILibAsyncServerSocket.h" />
     <ClInclude Include="Microstack\ILibAsyncSocket.h" />
@@ -123,7 +122,7 @@ copy "$(ProjectDir)websocketsample.html" "$(OutputPath)"</Command>
     <ClCompile Include="WebRTC_MicroStackSample.c" />
   </ItemGroup>
   <ItemGroup>
-    <None Include="..\..\..\Bryan%27s Projects\WebRTC\WebRTC C Sample\websocketsample.html" />
+    <None Include="websocketsample.html" />
     <None Include="webrtcpassivesample.html" />
     <None Include="webrtcsample.html" />
   </ItemGroup>

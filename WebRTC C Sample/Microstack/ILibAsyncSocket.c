@@ -1015,6 +1015,7 @@ void ILibProcessAsyncSocket(struct ILibAsyncSocketModule *Reader, int pendingRea
 		bytesReceived = recv(Reader->internalSocket, Reader->buffer, Reader->MallocSize, MSG_PEEK);
 		if(ILibAsyncSocket_TLSDetect(Reader->buffer, 0, bytesReceived)==0)
 		{
+			SSL_free(Reader->ssl);
 			Reader->ssl = NULL;
 			if(Reader->OnConnect!=NULL)
 			{
